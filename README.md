@@ -61,6 +61,29 @@ cd <repo> && set -a && . <env> && set +a && kamal deploy
 
 `jq`, `python3` with PyYAML (`pacman -S python-yaml`), ssh access to the boxes with `BatchMode` keys, and `kamal` on PATH for the deploy and logs actions. The polling loop needs none of the last one — it only ever runs `docker ps`.
 
-## What it never does
+## What it reads, what it writes, what it can change
 
-It does not deploy, restart, or write anything on a remote box; the only remote command is a read-only `docker ps`. It does not read secret values — only the variable names on the left of the `=`. The deploy action runs in a visible terminal, behind a confirmation, never silently.
+**The polling loop is read-only, locally and remotely.** It makes one HTTPS request to each app's health URL, and one ssh connection per app running a single `docker ps`. It writes no file, and it changes nothing on any box.
+
+**The two panel actions do change things, and both open a visible terminal so you watch them run.** `d` runs `kamal deploy`, which builds an image, pushes it to your registry and replaces the running containers on the box — behind a confirmation dialog naming the host, the command and how many commits it ships. `l` runs `kamal app logs -f`. Neither runs without a keypress, and neither runs at all when the configured env file is missing a variable `.kamal/secrets` requires.
+
+**Files it reads:** `~/.config/omarchy/kamal.json` (the app list), and per app, that repo's `config/deploy.yml`, its `.kamal/secrets`, and the env file you named. Each is opened once through `bin/kamal-read` with `O_NOFOLLOW|O_NONBLOCK`, validated on the descriptor (regular file, owned by you, one link) and read with a byte ceiling, so a symlink or a FIFO planted at one of those paths is refused rather than followed or waited on.
+
+**Secret values are never read.** The credential check reports the variable NAMES on the left of each `=` in `.kamal/secrets` and in the env file, and compares the two sets. Nothing to the right of an `=` is parsed, stored, logged or displayed. The env file's mode comes from the descriptor that was read, and is reported when it is not `600`.
+
+**Files it writes:** none. There is no cache and no state file.
+
+**Network:** the health URL you configured or the `proxy.host` from `config/deploy.yml`, over HTTPS, with no redirects followed and a byte and time limit. Nothing else, and no telemetry.
+
+## Removing
+
+```bash
+omarchy plugin remove ianswope.kamal
+```
+
+That removes the widget. Two things it does not touch, because the plugin does not own them:
+
+- `~/.config/omarchy/kamal.json` — your app list. Delete it by hand if you want it gone. It holds paths and hostnames, no credentials.
+- `~/.config/omarchy/shell.json` and `stacks.json` — remove the `ianswope.kamal` entry from wherever you placed the widget.
+
+Nothing else survives: no daemon is started, no timer or unit is installed, no cache or state file is written, and nothing is granted that would need revoking.

@@ -12,8 +12,15 @@ var MAX_TEXT = 200
 
 function sanitize(value) {
   var s = String(value === undefined || value === null ? "" : value)
-  s = s.replace(/[<>]/g, "")
-  s = s.replace(/[\x00-\x1f\x7f]/g, " ")
+  // `&` as well as the angle brackets: an ampersand alone is enough to build an
+  // entity, and these strings also reach PanelHero, ConfirmDialog and the bar
+  // tooltip, which the shell renders with AutoText and a plugin cannot pin to
+  // PlainText from here.
+  s = s.replace(/[<>&]/g, "")
+  // C0, DEL and C1, then the bidi overrides, which can make a hostname or a
+  // container name read as something other than what it is.
+  s = s.replace(/[\x00-\x1f\x7f-\x9f]/g, " ")
+  s = s.replace(/[‎‏‪-‮⁦-⁩]/g, "")
   s = s.replace(/\s+/g, " ").trim()
   if (s.length > MAX_TEXT) s = s.substring(0, MAX_TEXT - 1) + "…"
   return s

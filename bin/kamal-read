@@ -1,0 +1,265 @@
+#!/usr/bin/python3 -I
+"""Bounded, descriptor-bound reads of the four files this plugin did not create.
+
+Every subcommand does exactly ONE open of the pathname it was given, with
+O_NOFOLLOW so a symlink planted at the final component is refused rather than
+followed, and O_NONBLOCK so a FIFO planted there cannot block the poll forever.
+It then fstats THAT descriptor -- regular file, owned by us, one link -- and
+reads at most `limit + 1` bytes from the same descriptor, rejecting overflow
+instead of truncating it into shape.
+
+The pathname is never resolved twice. Nothing here reads a value: the two
+credential subcommands report the NAMES on the left of each `=` and nothing
+that follows it, which is all the widget needs to answer "would this env file
+satisfy this .kamal/secrets".
+
+-I (isolated) and not -S: -S would drop site-packages, and `deploy-yml` needs
+PyYAML from there. -I already ignores PYTHONPATH and the per-user site
+directory, which is the part another process can write to.
+"""
+
+import json
+import os
+import re
+import stat
+import sys
+
+# Generous against every real file of each kind, small against a planted one.
+LIMITS = {
+    "config": 64 * 1024,
+    "deploy-yml": 256 * 1024,
+    "names": 64 * 1024,
+}
+MAX_NAMES = 500
+NAME_RE = re.compile(r"^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+
+
+def out(payload):
+    print(json.dumps(payload))
+    sys.exit(0)
+
+
+def fail(message):
+    out({"ok": False, "error": message})
+
+
+def read_bounded(path, limit):
+    """One open, validated on the descriptor, at most limit + 1 bytes from it."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        fail("no such file: %s" % path)
+    except OSError as exc:
+        # ELOOP is the symlink refusal, which is worth naming distinctly: it is
+        # the case that means someone put something where this file should be.
+        if exc.errno == 40:  # ELOOP
+            fail("refusing to read through a symlink: %s" % path)
+        fail("cannot open %s (%s)" % (path, exc.__class__.__name__))
+
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            fail("not a regular file: %s" % path)
+        if info.st_uid != os.geteuid():
+            fail("not owned by this user: %s" % path)
+        if info.st_nlink != 1:
+            fail("refusing a file with %d links: %s" % (info.st_nlink, path))
+        # Clear O_NONBLOCK now that the descriptor is known to be a regular
+        # file; it exists only to survive the open of a planted FIFO.
+        os.set_blocking(fd, True)
+
+        chunks, total = [], 0
+        while total <= limit:
+            chunk = os.read(fd, min(65536, limit + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if total > limit:
+            fail("%s is larger than %d bytes" % (path, limit))
+        data = b"".join(chunks)
+    finally:
+        os.close(fd)
+
+    # The mode comes from the descriptor that was actually read, not from a
+    # second stat of the name, so it describes the file the answer is about.
+    return data, stat.S_IMODE(info.st_mode)
+
+
+def decode(data, path):
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        fail("%s is not valid UTF-8" % path)
+
+
+def cmd_config(path):
+    data, _ = read_bounded(path, LIMITS["config"])
+    text = decode(data, path)
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        fail("config is not valid JSON: %s" % path)
+    if not isinstance(doc, dict):
+        fail("config is not a JSON object: %s" % path)
+    apps = doc.get("apps")
+    if apps is None:
+        apps = []
+    if not isinstance(apps, list):
+        fail("config `apps` is not a list: %s" % path)
+    if len(apps) > 100:
+        fail("config lists %d apps; the limit is 100" % len(apps))
+    # Re-emitted as a strictly shaped document: every field is a string, so
+    # nothing downstream has to cope with a number, a null or a nested object
+    # arriving where a name was expected.
+    clean = []
+    for entry in apps:
+        if not isinstance(entry, dict):
+            fail("config `apps` holds something that is not an object")
+        row = {}
+        for key in ("name", "repo", "branch", "env", "url", "health", "ssh"):
+            value = entry.get(key, "")
+            if value is None:
+                value = ""
+            if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+                fail("config field `%s` must be a string" % key)
+            row[key] = str(value)[:400]
+        clean.append(row)
+    out({"ok": True, "error": "", "apps": clean})
+
+
+def cmd_names(path, want_literals):
+    """The variable NAMES a shell-syntax file defines, and how it defines them.
+
+    Kamal evaluates .kamal/secrets as shell, so each line is one of three
+    things: NAME=$NAME or NAME=${OTHER} must come from the deploying
+    environment; NAME=$(command) resolves itself and needs nothing; NAME=literal
+    is a secret sitting in the clear, which is worth counting.
+    """
+    data, mode = read_bounded(path, LIMITS["names"])
+    text = decode(data, path)
+
+    required, defined, literals = [], [], 0
+    for line in text.splitlines():
+        if len(line) > 4096:
+            continue
+        match = NAME_RE.match(line)
+        if not match:
+            continue
+        name, rhs = match.group(1), match.group(2).strip()
+        if len(defined) < MAX_NAMES:
+            defined.append(name)
+        if rhs.startswith("$("):
+            continue
+        if rhs.startswith("$"):
+            ref = rhs[1:]
+            if ref.startswith("{") and ref.endswith("}"):
+                ref = ref[1:-1]
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", ref) and len(required) < MAX_NAMES:
+                required.append(ref)
+        elif rhs:
+            literals += 1
+
+    payload = {
+        "ok": True,
+        "error": "",
+        "mode": "%o" % mode,
+        "required": sorted(set(required)),
+        "defined": sorted(set(defined)),
+    }
+    if want_literals:
+        payload["literals"] = literals
+    out(payload)
+
+
+def cmd_deploy_yml(path):
+    data, _ = read_bounded(path, LIMITS["deploy-yml"])
+    text = decode(data, path)
+    try:
+        import yaml
+    except ImportError:
+        fail("python yaml module not installed (pacman -S python-yaml)")
+    try:
+        # safe_load, never load: a deploy.yml is a config file, but it is still
+        # input, and a full load constructs arbitrary python objects.
+        doc = yaml.safe_load(text)
+    except Exception:  # noqa: BLE001 - any parse error is reported, not raised
+        fail("could not parse %s" % path)
+
+    if not isinstance(doc, dict):
+        fail("%s is not a YAML mapping" % path)
+
+    # --- roles and their hosts ---------------------------------------------
+    # `servers:` is either a list (one implicit "web" role) or a mapping of role
+    # name to a host list or to {hosts:, cmd:, proxy:}.
+    roles = []
+    servers = doc.get("servers")
+    if isinstance(servers, list):
+        roles.append({"name": "web", "hosts": [str(h)[:255] for h in servers[:50]],
+                      "proxied": True})
+    elif isinstance(servers, dict):
+        for name, spec in list(servers.items())[:20]:
+            hosts, proxied = [], True
+            if isinstance(spec, list):
+                hosts = [str(h)[:255] for h in spec[:50]]
+            elif isinstance(spec, dict):
+                raw = spec.get("hosts") or []
+                if isinstance(raw, list):
+                    hosts = [str(h)[:255] for h in raw[:50]]
+                elif raw:
+                    hosts = [str(raw)[:255]]
+                # proxy: false marks a role nothing routes to -- a jobs
+                # container, typically. It is why this widget reports roles at
+                # all: no health check will notice that one has died.
+                proxied = spec.get("proxy", True) is not False
+            roles.append({"name": str(name)[:64], "hosts": hosts, "proxied": proxied})
+
+    # --- the name the health check is made against -------------------------
+    proxy = doc.get("proxy") if isinstance(doc.get("proxy"), dict) else {}
+    host = ""
+    if proxy.get("host"):
+        host = str(proxy["host"])[:255]
+    elif isinstance(proxy.get("hosts"), list) and proxy["hosts"]:
+        host = str(proxy["hosts"][0])[:255]
+
+    healthcheck = proxy.get("healthcheck") if isinstance(proxy.get("healthcheck"), dict) else {}
+    health_path = str(healthcheck.get("path") or "/up")[:255]
+    if not health_path.startswith("/"):
+        health_path = "/" + health_path
+
+    ssh = doc.get("ssh") if isinstance(doc.get("ssh"), dict) else {}
+
+    out({
+        "ok": True,
+        "error": "",
+        "service": str(doc.get("service") or "")[:128],
+        "roles": roles,
+        "proxyHost": host,
+        # Reported, not acted on: the app may still be reached over https
+        # through a separate edge (nginx + certbot), which is exactly
+        # PromoEQP.com's shape.
+        "proxySsl": proxy.get("ssl", False) is True,
+        "healthPath": health_path,
+        "sshUser": str(ssh.get("user") or "root")[:64],
+    })
+
+
+def main():
+    if len(sys.argv) < 3:
+        fail("usage: kamal-read <config|deploy-yml|secret-names|env-names> <path>")
+    verb, path = sys.argv[1], sys.argv[2]
+    if not path.startswith("/"):
+        fail("path must be absolute: %s" % path)
+    if verb == "config":
+        cmd_config(path)
+    elif verb == "deploy-yml":
+        cmd_deploy_yml(path)
+    elif verb == "secret-names":
+        cmd_names(path, want_literals=True)
+    elif verb == "env-names":
+        cmd_names(path, want_literals=False)
+    else:
+        fail("unknown subcommand: %s" % verb)
+
+
+main()

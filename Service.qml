@@ -56,8 +56,12 @@ Item {
   function refresh(withFetch) {
     if (statusProcess.running) return
     refreshing = true
+    resetStatusBuffers()
     var cfg = configOverride !== "" ? configOverride : (Quickshell.env("HOME") + "/.config/omarchy/kamal.json")
-    statusProcess.command = ["bash", helperPath, cfg, withFetch === true ? "1" : "0"]
+    // An argv array, and an absolute interpreter: a bare "bash" resolves
+    // through a PATH another process can prepend to, and this child is the one
+    // that reaches the deploy boxes over ssh.
+    statusProcess.command = ["/usr/bin/bash", helperPath, cfg, withFetch === true ? "1" : "0"]
     statusProcess.running = true
   }
 
@@ -158,21 +162,91 @@ Item {
     onTriggered: root.actionStatus = ""
   }
 
+  // No StdioCollector anywhere. A collector retains the whole of a child's
+  // stdout before any length check of ours can run, and this child talks to
+  // machines over ssh. The authoritative byte ceiling is at the producer --
+  // bin/omarchy-kamal-status refuses to emit a document over its own limit --
+  // and these budgets are the second ceiling, enforced chunk by chunk as the
+  // bytes arrive so an overrun is killed rather than buffered.
+  //
+  // splitMarker: "" delivers raw chunks. A default SplitParser would buffer
+  // until a newline before onRead could reject anything, which is no ceiling at
+  // all for output that contains none.
+  property string statusText: ""
+  property string statusErrText: ""
+  property int statusChars: 0
+  property int statusErrChars: 0
+  property bool statusOverflowed: false
+  readonly property int statusMaxChars: 262144
+  readonly property int statusErrMaxChars: 4096
+
+  function resetStatusBuffers() {
+    statusText = ""
+    statusErrText = ""
+    statusChars = 0
+    statusErrChars = 0
+    statusOverflowed = false
+  }
+
+  // TERM first, then KILL if it is still there: `signal()` reaches the child
+  // this Process owns, and the escalation timer outlives the first attempt.
+  function abortStatus(reason) {
+    if (statusOverflowed) return
+    statusOverflowed = true
+    lastError = reason
+    statusProcess.signal(15)
+    statusKillTimer.restart()
+  }
+
+  Timer {
+    id: statusKillTimer
+    interval: 2000
+    repeat: false
+    onTriggered: if (statusProcess.running) statusProcess.signal(9)
+  }
+
   Process {
     id: statusProcess
     running: false
     command: []
-    stdout: StdioCollector { id: statusStdout; waitForEnd: true }
-    stderr: StdioCollector { id: statusStderr; waitForEnd: true }
+    stdout: SplitParser {
+      splitMarker: ""
+      onRead: function(chunk) {
+        if (root.statusOverflowed) return
+        root.statusChars += String(chunk).length
+        if (root.statusChars > root.statusMaxChars) {
+          root.abortStatus("Kamal status output exceeded " + root.statusMaxChars + " characters")
+          return
+        }
+        root.statusText += chunk
+      }
+    }
+    stderr: SplitParser {
+      splitMarker: ""
+      onRead: function(chunk) {
+        if (root.statusErrChars > root.statusErrMaxChars) return
+        root.statusErrChars += String(chunk).length
+        // Bounded and kept only to explain a failure; rendered as PlainText
+        // like everything else, after Model.sanitize caps it again.
+        root.statusErrText += chunk
+      }
+    }
     onExited: function(exitCode) {
       root.refreshing = false
-      var out = String(statusStdout.text || "")
+      statusKillTimer.stop()
+      if (root.statusOverflowed) {
+        root.everLoaded = true
+        root.healthInfo = { level: "critical", headline: root.lastError,
+                            issues: [{ level: "critical", text: root.lastError }] }
+        return
+      }
+      var out = String(root.statusText || "")
       if (out.trim() !== "") {
         root.applyStatus(out)
         return
       }
       root.everLoaded = true
-      root.lastError = Model.sanitize(statusStderr.text) || ("Could not run " + root.helperPath)
+      root.lastError = Model.sanitize(root.statusErrText) || ("Could not run " + root.helperPath)
       root.healthInfo = { level: "critical", headline: root.lastError,
                           issues: [{ level: "critical", text: root.lastError }] }
     }
