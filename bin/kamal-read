@@ -178,7 +178,7 @@ def cmd_deploy_yml(path):
     try:
         import yaml
     except ImportError:
-        fail("python yaml module not installed (pacman -S python-yaml)")
+        fail("python yaml module not installed (the python-yaml package on Arch)")
     try:
         # safe_load, never load: a deploy.yml is a config file, but it is still
         # input, and a full load constructs arbitrary python objects.

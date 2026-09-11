@@ -59,7 +59,7 @@ cd <repo> && set -a && . <env> && set +a && kamal deploy
 
 ## Requirements
 
-`jq`, `python3` with PyYAML (`pacman -S python-yaml`), ssh access to the boxes with `BatchMode` keys, and `kamal` on PATH for the deploy and logs actions. The polling loop needs none of the last one — it only ever runs `docker ps`.
+`jq`, `python3` with the PyYAML module (the `python-yaml` package on Arch), ssh access to the boxes with `BatchMode` keys, and `kamal` on PATH for the deploy and logs actions. The polling loop needs none of the last one — it only ever runs `docker ps`.
 
 ## What it reads, what it writes, what it can change
 
