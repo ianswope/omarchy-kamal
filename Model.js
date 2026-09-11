@@ -266,11 +266,27 @@ function health(status) {
     }
   })
 
+  // An app with no repo reports the same sentence as its config error and as
+  // its revision error, because the second is caused by the first. De-duplicate
+  // on the rendered text rather than special-casing that one pair: any two
+  // checks that reach the same conclusion should say it once.
+  issues = dedupe(issues)
+
   var level = "ok"
   if (issues.some(function(i) { return i.level === "critical" })) level = "critical"
   else if (issues.some(function(i) { return i.level === "warn" })) level = "warn"
 
   return { level: level, headline: headlineFor(status, level, issues), issues: issues }
+}
+
+function dedupe(issues) {
+  var seen = {}
+  return (issues || []).filter(function(i) {
+    var key = i.level + "\u0000" + i.text
+    if (seen[key]) return false
+    seen[key] = true
+    return true
+  })
 }
 
 function headlineFor(status, level, issues) {

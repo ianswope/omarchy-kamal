@@ -279,9 +279,15 @@ Panel {
           spacing: Style.space(6)
           visible: faults.length > 0
 
-          readonly property var faults: (kamal.issues || []).filter(function(i) {
+          // Capped. One row per app can produce several faults each, and an
+          // unbounded column here pushes the app list itself off the top of
+          // the panel -- the list is what the panel is for.
+          readonly property int faultLimit: 3
+          readonly property var allFaults: (kamal.issues || []).filter(function(i) {
             return i.level === "critical" || i.level === "warn"
           })
+          readonly property var faults: allFaults.slice(0, faultLimit)
+          readonly property int hiddenFaults: Math.max(0, allFaults.length - faultLimit)
 
           Repeater {
             model: faultColumn.faults
@@ -308,6 +314,17 @@ Panel {
                 wrapMode: Text.WordWrap
               }
             }
+          }
+
+          Text {
+            visible: faultColumn.hiddenFaults > 0
+            width: parent.width
+            text: "and " + faultColumn.hiddenFaults + " more"
+            textFormat: Text.PlainText
+            color: Qt.darker(root.dim, 1.15)
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
           }
         }
       }
