@@ -1,0 +1,404 @@
+#!/bin/bash
+
+# Emit one JSON document describing every configured Kamal app: whether it
+# answers its health check, which revision is actually running, whether every
+# role is up, how far the running revision is from what you pushed, and whether
+# the secrets file you would deploy with can satisfy .kamal/secrets.
+#
+# A reporter. It never deploys, restarts or writes anything remote; the only
+# remote command is a read-only `docker ps`, and the only action that changes
+# anything runs in a visible terminal from the panel.
+#
+# WHY THIS IS NOT THE ssh-CHECKOUT WIDGET. A Kamal box has no git checkout to
+# read a revision from -- the release is a container image, and its git sha is
+# carried in the `version` label Kamal stamps on every container it starts. So
+# the live revision is read from the container, and roles are reported one by
+# one: a `proxy: false` role (a jobs container) is invisible to any health
+# check, and a dead one is silent until the queue backs up.
+#
+# Apps come from a JSON config (default ~/.config/omarchy/kamal.json) because
+# the bar's own settings schema has no array type.
+
+set -o pipefail
+
+CONFIG="${1:-$HOME/.config/omarchy/kamal.json}"
+# The path arrives as an argument, so no shell expands a leading tilde for us.
+[[ $CONFIG == "~"* ]] && CONFIG="$HOME${CONFIG#\~}"
+# Refresh remote-tracking refs before comparing. Off by default: a widget that
+# polls should not hit the network on every tick, and a stale origin/main is
+# reported as stale rather than silently mistaken for the truth.
+# Normalised to exactly 0 or 1 rather than used as given: this value reaches an
+# arithmetic context, and bash runs a command substitution found inside one.
+DO_FETCH=0
+[[ ${2:-0} == 1 ]] && DO_FETCH=1
+
+HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+YML_READER="$HERE/kamal-deploy-yml"
+
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=5)
+SSH_DEADLINE=12
+CURL_DEADLINE=8
+
+fail_json() {
+  jq -n --arg error "$1" --arg config "$CONFIG" \
+    '{ok: false, error: $error, configPath: $config, apps: []}'
+  exit 0
+}
+
+command -v jq >/dev/null 2>&1 || { printf '{"ok":false,"error":"jq is not installed","apps":[]}\n'; exit 0; }
+
+# jq takes this path as a filename, and reads a leading dash as an option, so an
+# absolute path is required and every call below terminates its options with --.
+if [[ $CONFIG != /* ]]; then
+  fail_json "config path must be absolute: $CONFIG"
+fi
+
+NOW=$(date +%s)
+
+if [[ ! -f $CONFIG ]]; then
+  # Not an error: a fresh install has nothing configured yet, and the panel says
+  # so with the path to create.
+  jq -n --arg config "$CONFIG" \
+    '{ok: true, error: "", configured: false, configPath: $config, now: 0, apps: []}'
+  exit 0
+fi
+
+jq -e . -- "$CONFIG" >/dev/null 2>&1 || fail_json "config is not valid JSON: $CONFIG"
+
+# ssh concatenates its command arguments and hands them to the remote login
+# shell, which re-parses them. Anything interpolated into that string is
+# therefore remote shell input, not an argument, so it has to be quoted for the
+# remote shell explicitly. The POSIX idiom: wrap in single quotes and replace
+# each embedded single quote with '\''.
+shell_quote() {
+  local s=${1//\'/\'\\\'\'}
+  printf "'%s'" "$s"
+}
+
+# A host spec is a host spec. It must not begin with a dash: ssh would read that
+# as an option, and `-F<file>` points it at an arbitrary config file, which can
+# set a ProxyCommand. The invocation also terminates its options before it.
+ssh_target_is_safe() {
+  [[ $1 =~ ^[A-Za-z0-9._@%+:][A-Za-z0-9._@%+:-]*$ ]]
+}
+
+# A Kamal service name reaches a remote `docker ps --filter`. Kamal itself only
+# accepts this shape, so anything else is a config mistake and is refused rather
+# than quoted -- the polling loop runs unattended, with no confirmation in front
+# of it.
+service_is_safe() {
+  [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+}
+
+# Local paths are read, and are also interpolated into the deploy command the
+# panel offers. Metacharacters in one are a config mistake in every realistic
+# case.
+path_is_safe() {
+  case "$1" in
+    *[\'\"\`\$\;\&\|\<\>\\]* | *$'\n'* | *$'\r'* ) return 1 ;;
+  esac
+  [[ -n $1 ]]
+}
+
+expand_home() {
+  local p="$1"
+  [[ $p == "~"* ]] && p="$HOME${p#\~}"
+  printf '%s' "$p"
+}
+
+# ---------------------------------------------------------------- secrets
+#
+# What .kamal/secrets REQUIRES, by name only. Values are never read, printed or
+# compared -- this asks "does the file you would deploy with define this name",
+# nothing more.
+#
+# Kamal evaluates that file as shell, so a line is one of three things:
+#   NAME=$NAME / NAME=${OTHER}  -> must come from the deploying environment
+#   NAME=$(command)             -> resolves itself, needs nothing
+#   NAME=literal                -> a secret committed in the clear, worth saying
+required_secret_names() {
+  local secrets="$1"
+  [[ -f $secrets ]] || return 0
+  sed -n 's/^[[:space:]]*\([A-Za-z_][A-Za-z0-9_]*\)=\(.*\)$/\1\t\2/p' -- "$secrets" |
+    while IFS=$'\t' read -r name rhs; do
+      case "$rhs" in
+        '$('*) : ;;                                   # self-resolving
+        '$'*)
+          local ref=${rhs#\$}
+          ref=${ref#\{}; ref=${ref%\}}
+          [[ $ref =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] && printf '%s\n' "$ref"
+          ;;
+        *) : ;;
+      esac
+    done | sort -u
+}
+
+# Which names a candidate env file defines. Names only; the file is never
+# sourced, and no value is read into a variable.
+provided_secret_names() {
+  local envfile="$1"
+  [[ -f $envfile ]] || return 0
+  sed -n 's/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}\([A-Za-z_][A-Za-z0-9_]*\)=.*/\2/p' -- "$envfile" | sort -u
+}
+
+literal_secret_count() {
+  local secrets="$1"
+  [[ -f $secrets ]] || { printf '0'; return; }
+  sed -n 's/^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=\(.*\)$/\1/p' -- "$secrets" |
+    grep -cv '^\$' || true
+}
+
+# ------------------------------------------------------------- per-app probes
+
+probe_app() {
+  local idx="$1" out="$2"
+  local name repo branch envfile url_override health_override ssh_override
+
+  name=$(jq -r --argjson i "$idx" '.apps[$i].name // ""' -- "$CONFIG")
+  repo=$(jq -r --argjson i "$idx" '.apps[$i].repo // ""' -- "$CONFIG")
+  branch=$(jq -r --argjson i "$idx" '.apps[$i].branch // "main"' -- "$CONFIG")
+  envfile=$(jq -r --argjson i "$idx" '.apps[$i].env // ""' -- "$CONFIG")
+  url_override=$(jq -r --argjson i "$idx" '.apps[$i].url // ""' -- "$CONFIG")
+  health_override=$(jq -r --argjson i "$idx" '.apps[$i].health // ""' -- "$CONFIG")
+  ssh_override=$(jq -r --argjson i "$idx" '.apps[$i].ssh // ""' -- "$CONFIG")
+  repo=$(expand_home "$repo")
+  envfile=$(expand_home "$envfile")
+
+  # --- what the app's own deploy.yml says ----------------------------------
+  local service="" roles_json="[]" proxy_host="" health_path="/up" ssh_user="root" cfg_err=""
+  if [[ -z $repo ]]; then
+    cfg_err="no repo configured"
+  elif ! path_is_safe "$repo"; then
+    cfg_err="refusing a repo path containing shell metacharacters"
+  elif [[ ! -f $repo/config/deploy.yml ]]; then
+    cfg_err="no config/deploy.yml in $repo"
+  else
+    local yml
+    yml=$(python3 "$YML_READER" "$repo/config/deploy.yml" 2>/dev/null)
+    if [[ -z $yml ]] || ! jq -e . >/dev/null 2>&1 <<<"$yml"; then
+      cfg_err="could not read $repo/config/deploy.yml"
+    elif [[ $(jq -r '.ok' <<<"$yml") != true ]]; then
+      cfg_err=$(jq -r '.error' <<<"$yml")
+    else
+      service=$(jq -r '.service' <<<"$yml")
+      roles_json=$(jq -c '.roles' <<<"$yml")
+      proxy_host=$(jq -r '.proxyHost' <<<"$yml")
+      health_path=$(jq -r '.healthPath' <<<"$yml")
+      ssh_user=$(jq -r '.sshUser' <<<"$yml")
+    fi
+  fi
+  [[ -n $health_override ]] && health_path="$health_override"
+
+  # --- health over HTTP ----------------------------------------------------
+  # https regardless of proxy.ssl: that flag says whether kamal-proxy terminates
+  # TLS itself, and an app behind nginx+certbot (proxy.ssl false) is still
+  # reached over https from here.
+  local url="$url_override"
+  [[ -z $url && -n $proxy_host ]] && url="https://$proxy_host"
+
+  local h_code=0 h_ms=0 h_err="" h_checked=false
+  if [[ -n $url ]] && [[ ! $url =~ ^[Hh][Tt][Tt][Pp][Ss]?:// ]]; then
+    # curl parses a leading dash as options rather than as an address, so an
+    # unchecked value silently becomes curl configuration on an unattended poll.
+    # Requiring the scheme rejects that and file:// reads in one test.
+    h_checked=true
+    h_err="url must begin with http:// or https://"
+  elif [[ -n $url ]]; then
+    h_checked=true
+    local probe
+    probe=$(curl -o /dev/null -sS -w '%{http_code} %{time_total}' \
+      --max-time "$CURL_DEADLINE" -- "${url%/}${health_path}" 2>&1)
+    if [[ $probe =~ ^([0-9]{3})[[:space:]]([0-9.]+)$ ]]; then
+      h_code=${BASH_REMATCH[1]}
+      h_ms=$(awk -v t="${BASH_REMATCH[2]}" 'BEGIN{printf "%d", t*1000}')
+    else
+      h_err=$(printf '%s' "$probe" | tr -d '\r' | tr '\n' ' ' | sed 's/  */ /g; s/^ //; s/ $//')
+    fi
+  fi
+
+  # --- the running containers, by role -------------------------------------
+  # One ssh to the first host of the first role. Kamal stamps every container it
+  # starts with service/role/version labels, so this is the whole story in one
+  # read: what is running, in which role, at which revision.
+  local d_sha="" d_err="" roles_state="[]"
+  local host=""
+  if [[ -n $ssh_override ]]; then
+    host="$ssh_override"
+  else
+    host=$(jq -r 'if length > 0 then (.[0].hosts[0] // "") else "" end' <<<"$roles_json")
+    [[ -n $host && $host != null ]] && host="$ssh_user@$host"
+  fi
+
+  if [[ -n $cfg_err ]]; then
+    d_err="$cfg_err"
+  elif [[ -z $service ]]; then
+    d_err="no service name in deploy.yml"
+  elif ! service_is_safe "$service"; then
+    d_err="refusing a service name with unexpected characters"
+  elif [[ -z $host || $host == null ]]; then
+    d_err="no host in deploy.yml"
+  elif ! ssh_target_is_safe "$host"; then
+    d_err="refusing an ssh target with unexpected characters"
+  else
+    local remote_cmd remote_out
+    # Only the interpolated VALUE is quoted for the remote shell. Quoting the
+    # whole command instead would hand the remote shell one enormous word to
+    # look up as a command name -- which fails silently here, because the
+    # `|| true` below is what keeps a box without docker from reading as an ssh
+    # failure, and it swallows a "command not found" just as happily.
+    # Kamal 2 labels a container service/role/destination and NOTHING ELSE --
+    # there is no `version` label. The revision is the trailing segment of the
+    # image tag (`ianswope/promoeqp-dashboard:<sha>`) and of the container name
+    # (`<service>[-<destination>]-<role>-<sha>`), so both are read and the first
+    # one that looks like a git sha wins.
+    remote_cmd="docker ps -a --filter label=service=$(shell_quote "$service") --format '{{.Label \"role\"}}|{{.Names}}|{{.Image}}|{{.State}}'"
+    remote_out=$(timeout "$SSH_DEADLINE" ssh "${SSH_OPTS[@]}" -- "$host" \
+      "$remote_cmd 2>/dev/null || true" 2>&1)
+    if [[ $? -eq 0 ]]; then
+      remote_out=$(printf '%s' "$remote_out" | tr -d '\r')
+      if [[ -z ${remote_out//[[:space:]]/} ]]; then
+        d_err="no containers labelled service=$service on $host"
+      else
+        # Per declared role: how many of its containers are running, and at what
+        # revision. A role declared in deploy.yml with nothing running is the
+        # signal this widget exists for.
+        roles_state=$(jq -c --arg out "$remote_out" '
+          def revision($name; $image):
+            (($image | split(":") | last) // "") as $tag
+            | if ($tag | test("^[0-9a-f]{7,40}$")) then $tag
+              else (($name | split("-") | last) // "") end;
+          ($out | split("\n") | map(select(length > 0) | split("|"))
+                | map({role: .[0], version: revision(.[1]; .[2]), state: .[3]})) as $c
+          | map(. as $r
+              | ($c | map(select(.role == $r.name))) as $mine
+              | {name: $r.name,
+                 proxied: $r.proxied,
+                 running: ($mine | map(select(.state == "running")) | length),
+                 total: ($mine | length),
+                 version: (($mine | map(select(.state == "running")) | .[0].version) // "")})
+        ' <<<"$roles_json")
+        # The revision of the proxied role is the one the site is serving.
+        d_sha=$(jq -r 'map(select(.proxied)) | (.[0].version // "")' <<<"$roles_state")
+        [[ -z $d_sha || $d_sha == null ]] && d_sha=$(jq -r '(.[0].version // "")' <<<"$roles_state")
+        [[ $d_sha == null ]] && d_sha=""
+        if [[ -n $d_sha && ! $d_sha =~ ^[0-9a-f]{7,40}$ ]]; then
+          d_err="running container carries no git version label"
+          d_sha=""
+        fi
+      fi
+    else
+      d_err=$(printf '%s' "$remote_out" | tr -d '\r' | tr '\n' ' ' | sed 's/  */ /g; s/^ //; s/ $//')
+      d_err=${d_err:-"ssh to $host failed"}
+    fi
+  fi
+
+  # --- local side: what is pushed, what is not, what is uncommitted --------
+  local o_sha="" head_sha="" behind=-1 unpushed=-1 fetched=0 dirty=false l_err="" d_when=""
+  if [[ -n $repo && -d $repo/.git ]]; then
+    (( DO_FETCH )) && git -C "$repo" fetch -q origin 2>/dev/null
+    o_sha=$(git -C "$repo" rev-parse --verify --quiet "origin/$branch" 2>/dev/null)
+    head_sha=$(git -C "$repo" rev-parse --verify --quiet HEAD 2>/dev/null)
+    # Kamal tags the image with `git rev-parse HEAD`, so a deploy from a dirty
+    # tree produces an image labelled with a commit it does not contain. Worth
+    # its own signal, not folded into "unpushed".
+    [[ -n $(git -C "$repo" status --porcelain 2>/dev/null) ]] && dirty=true
+    if [[ -n $o_sha ]]; then
+      if [[ -n $d_sha ]] && git -C "$repo" cat-file -e "$d_sha^{commit}" 2>/dev/null; then
+        behind=$(git -C "$repo" rev-list --count "$d_sha..origin/$branch" 2>/dev/null || echo -1)
+        d_when=$(git -C "$repo" log -1 --format=%cI "$d_sha" 2>/dev/null)
+      fi
+      [[ -n $head_sha ]] && unpushed=$(git -C "$repo" rev-list --count "origin/$branch..HEAD" 2>/dev/null || echo -1)
+    else
+      l_err="no origin/$branch in $repo"
+    fi
+    # When the remote ref was last refreshed, so the panel can admit how old its
+    # idea of "pushed" is instead of implying it is live.
+    for f in FETCH_HEAD refs/remotes/origin/"$branch"; do
+      if [[ -e $repo/.git/$f ]]; then
+        fetched=$(stat -c %Y "$repo/.git/$f" 2>/dev/null || echo 0)
+        break
+      fi
+    done
+  elif [[ -n $repo ]]; then
+    l_err="not a git repo: $repo"
+  fi
+
+  # --- can the configured env file actually satisfy .kamal/secrets? --------
+  # The failure this catches: two apps whose secrets files collide by name, so
+  # sourcing the wrong one deploys an app with another's credentials, or dies
+  # mid-deploy on a variable nobody looked up.
+  local s_checked=false s_missing="[]" s_mode="" s_err="" s_literals=0
+  if [[ -n $repo && -f $repo/.kamal/secrets ]]; then
+    s_literals=$(literal_secret_count "$repo/.kamal/secrets")
+    if [[ -z $envfile ]]; then
+      s_err="no env file configured"
+    elif ! path_is_safe "$envfile"; then
+      s_err="refusing an env path containing shell metacharacters"
+    elif [[ $envfile != /* ]]; then
+      s_err="env path must be absolute: $envfile"
+    elif [[ ! -f $envfile ]]; then
+      s_err="no such env file: $envfile"
+    else
+      s_checked=true
+      s_mode=$(stat -c %a -- "$envfile" 2>/dev/null)
+      local missing
+      missing=$(comm -23 <(required_secret_names "$repo/.kamal/secrets") \
+                         <(provided_secret_names "$envfile"))
+      s_missing=$(printf '%s' "$missing" | jq -R -s 'split("\n") | map(select(length > 0))')
+    fi
+  fi
+
+  jq -n \
+    --arg name "$name" --arg repo "$repo" --arg branch "$branch" \
+    --arg service "$service" --arg url "$url" --arg healthPath "$health_path" \
+    --arg host "$host" --arg envfile "$envfile" --arg cfgErr "$cfg_err" \
+    --argjson hChecked "$h_checked" --argjson hCode "${h_code:-0}" \
+    --argjson hMs "${h_ms:-0}" --arg hErr "$h_err" \
+    --arg dSha "$d_sha" --arg dWhen "$d_when" --arg dErr "$d_err" \
+    --argjson roles "$roles_state" \
+    --arg oSha "$o_sha" --arg headSha "$head_sha" \
+    --argjson behind "${behind:--1}" --argjson unpushed "${unpushed:--1}" \
+    --argjson dirty "$dirty" --argjson fetched "${fetched:-0}" --arg lErr "$l_err" \
+    --argjson sChecked "$s_checked" --argjson sMissing "$s_missing" \
+    --arg sMode "$s_mode" --arg sErr "$s_err" --argjson sLiterals "${s_literals:-0}" \
+    '{
+      name: $name, repo: $repo, branch: $branch, service: $service,
+      url: $url, healthPath: $healthPath, host: $host, env: $envfile,
+      configError: $cfgErr,
+      health: {checked: $hChecked, code: $hCode, ok: ($hCode >= 200 and $hCode < 400),
+               latencyMs: $hMs, error: $hErr},
+      deployed: {sha: $dSha, short: ($dSha | .[0:7]), committedAt: $dWhen,
+                 error: $dErr, roles: $roles},
+      local: {originSha: $oSha, originShort: ($oSha | .[0:7]),
+              headSha: $headSha, headShort: ($headSha | .[0:7]),
+              behind: $behind, unpushed: $unpushed, dirty: $dirty,
+              fetchedAt: $fetched, error: $lErr},
+      secrets: {checked: $sChecked, missing: $sMissing, mode: $sMode,
+                literals: $sLiterals, error: $sErr}
+    }' >"$out"
+}
+
+count=$(jq -r '(.apps // []) | length' -- "$CONFIG")
+if (( count == 0 )); then
+  jq -n --arg config "$CONFIG" \
+    '{ok: true, error: "", configured: false, configPath: $config, now: 0, apps: []}'
+  exit 0
+fi
+
+# Probe every app at once: each one costs an ssh round trip, so doing them in
+# series would make the refresh time scale with the number of servers.
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT
+for (( i = 0; i < count; i++ )); do
+  probe_app "$i" "$tmpdir/app-$i.json" &
+done
+wait
+
+apps=$(for (( i = 0; i < count; i++ )); do
+  [[ -s $tmpdir/app-$i.json ]] && cat "$tmpdir/app-$i.json"
+done | jq -s '.')
+
+jq -n --argjson now "$NOW" --argjson apps "$apps" --arg config "$CONFIG" \
+      --argjson fetched "$DO_FETCH" \
+  '{ok: true, error: "", configured: true, configPath: $config,
+    now: $now, didFetch: ($fetched == 1), apps: $apps}'

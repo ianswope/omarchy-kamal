@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "id": "ianswope.kamal",
+  "name": "Kamal",
+  "version": "0.1.0",
+  "author": "Ian Swope",
+  "license": "MIT",
+  "description": "Kamal 2 apps in the Omarchy bar: whether each one answers, which revision its containers are actually running, whether every role is up, and how far that is behind what you pushed.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Kamal",
+    "description": "Health, running revision, per-role container state and undeployed-commit count for each Kamal app, with deploy from the panel.",
+    "category": "Developer Tools",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 300,
+      "showCount": true,
+      "configPath": ""
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 60,
+        "max": 3600,
+        "step": 30,
+        "defaultValue": 300
+      },
+      {
+        "key": "showCount",
+        "type": "boolean",
+        "label": "Show the count of apps needing attention",
+        "defaultValue": true
+      },
+      {
+        "key": "configPath",
+        "type": "path",
+        "label": "App list (defaults to ~/.config/omarchy/kamal.json)",
+        "defaultValue": ""
+      }
+    ]
+  }
+}
