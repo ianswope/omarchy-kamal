@@ -37,6 +37,18 @@ Item {
 
   readonly property string pluginDir: String(Qt.resolvedUrl(".")).replace(/^file:\/\//, "").replace(/\/$/, "")
   readonly property string helperPath: pluginDir + "/bin/omarchy-kamal-status"
+
+  // Every executable this plugin starts, by absolute path. A bare name is a
+  // PATH lookup, and PATH is inherited from the session, so another process
+  // that has prepended a directory to it chooses the program that runs -- for
+  // a widget on a timer, repeatedly, and for the deploy action at the moment a
+  // human asks for it. The omarchy package installs its four launchers in
+  // /usr/bin as well as in /usr/share/omarchy/bin; /usr/bin is the copy every
+  // Omarchy machine has, so it is the one named here.
+  readonly property string binTerminal: "/usr/bin/omarchy-launch-floating-terminal-with-presentation"
+  readonly property string binBrowser: "/usr/bin/omarchy-launch-browser"
+  readonly property string binConfigEditor: "/usr/bin/omarchy-launch-config-editor"
+  readonly property string binWlCopy: "/usr/bin/wl-copy"
   readonly property string configOverride: String(setting("configPath", ""))
 
   function setting(name, fallback) {
@@ -58,10 +70,28 @@ Item {
     refreshing = true
     resetStatusBuffers()
     var cfg = configOverride !== "" ? configOverride : (Quickshell.env("HOME") + "/.config/omarchy/kamal.json")
-    // An argv array, and an absolute interpreter: a bare "bash" resolves
-    // through a PATH another process can prepend to, and this child is the one
-    // that reaches the deploy boxes over ssh.
-    statusProcess.command = ["/usr/bin/bash", helperPath, cfg, withFetch === true ? "1" : "0"]
+    // An argv array, absolute paths throughout, and the environment replaced
+    // before any interpreter starts.
+    //
+    // The helper replaces its own environment too, for when a person runs it
+    // from a terminal -- but a shell reads BASH_ENV and the loader reads
+    // LD_PRELOAD at startup, which is before the helper's first line. Doing it
+    // here means no bash ever starts holding the session's environment. `env`
+    // also sets the marker the helper checks, so it does not then re-exec
+    // itself a second time.
+    //
+    // `setsid` puts the run in its own session, so the helper's watchdog has a
+    // process group that holds every descendant and nothing else.
+    statusProcess.command = ["/usr/bin/env", "-i",
+                             "KAMAL_STATUS_SUPERVISED=1",
+                             "PATH=/usr/bin:/bin",
+                             "LC_ALL=C",
+                             "HOME=" + Quickshell.env("HOME"),
+                             "SSH_AUTH_SOCK=" + Quickshell.env("SSH_AUTH_SOCK"),
+                             "XDG_RUNTIME_DIR=" + Quickshell.env("XDG_RUNTIME_DIR"),
+                             "/usr/bin/setsid", "-w",
+                             "/usr/bin/bash", "--", helperPath, cfg,
+                             withFetch === true ? "1" : "0"]
     statusProcess.running = true
   }
 
@@ -94,7 +124,7 @@ Item {
       note(app.name + ": " + app.env + " defines none of " + missing.join(", ") + " — fix that first")
       return
     }
-    Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation", cmd])
+    Quickshell.execDetached([root.binTerminal, cmd])
     note("Deploying " + app.name + " in a terminal…")
     settleTimer.restart()
   }
@@ -102,7 +132,7 @@ Item {
   function logs(app) {
     var cmd = Model.logsCommandFor(app)
     if (cmd === "") { note("No repo and env file configured for " + (app ? app.name : "that app")); return }
-    Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation", cmd])
+    Quickshell.execDetached([root.binTerminal, cmd])
     note("Tailing " + app.name + " logs…")
   }
 
@@ -111,14 +141,14 @@ Item {
     if (!Model.isSafeUrl(app.url)) {
       note("Not opening " + app.name + ": a url must begin with http:// or https://"); return
     }
-    Quickshell.execDetached(["omarchy-launch-browser", app.url])
+    Quickshell.execDetached([root.binBrowser, app.url])
     note("Opened " + app.url)
   }
 
   function copyDeployCommand(app) {
     var cmd = Model.deployCommandFor(app)
     if (cmd === "") return
-    Quickshell.execDetached(["wl-copy", "--", cmd])
+    Quickshell.execDetached([root.binWlCopy, "--", cmd])
     note("Copied deploy command")
   }
 
@@ -126,7 +156,7 @@ Item {
     var cfg = configPath !== "" ? configPath : (Quickshell.env("HOME") + "/.config/omarchy/kamal.json")
     // The editor reads a leading dash as an option too.
     if (cfg.charAt(0) !== "/") { note("Config path must be absolute: " + cfg); return }
-    Quickshell.execDetached(["omarchy-launch-config-editor", cfg])
+    Quickshell.execDetached([root.binConfigEditor, cfg])
     note("Opened " + cfg)
   }
 
@@ -188,8 +218,17 @@ Item {
     statusOverflowed = false
   }
 
-  // TERM first, then KILL if it is still there: `signal()` reaches the child
-  // this Process owns, and the escalation timer outlives the first attempt.
+  // Ending a run that has gone wrong, which takes both halves of a chain.
+  //
+  // `signal()` reaches only the child this Process owns, and that child is the
+  // `setsid` the helper re-execs through, so a signal here does NOT reach the
+  // per-app probes, their ssh connections, or a git fetch. What it does is
+  // remove the helper's parent, and the helper's own watchdog is watching for
+  // exactly that: an orphaned run stops instead of finishing, and the watchdog
+  // TERMs and then KILLs the whole process group. So the ceiling is enforced by
+  // stopping the producer, not merely by refusing to read any more of it.
+  //
+  // TERM first, then KILL if it is still there.
   function abortStatus(reason) {
     if (statusOverflowed) return
     statusOverflowed = true
@@ -224,8 +263,18 @@ Item {
     stderr: SplitParser {
       splitMarker: ""
       onRead: function(chunk) {
-        if (root.statusErrChars > root.statusErrMaxChars) return
+        if (root.statusOverflowed) return
         root.statusErrChars += String(chunk).length
+        if (root.statusErrChars > root.statusErrMaxChars) {
+          // Not a `return`. Declining to append leaves the child writing into a
+          // pipe nobody drains, which bounds this process's memory and nothing
+          // else: the producer keeps running, keeps its ssh connections open,
+          // and keeps producing. A ceiling that does not stop what is crossing
+          // it is a ceiling on the wrong side of the boundary.
+          root.abortStatus("Kamal status wrote more than " + root.statusErrMaxChars
+                           + " characters to stderr")
+          return
+        }
         // Bounded and kept only to explain a failure; rendered as PlainText
         // like everything else, after Model.sanitize caps it again.
         root.statusErrText += chunk
@@ -233,7 +282,10 @@ Item {
     }
     onExited: function(exitCode) {
       root.refreshing = false
-      statusKillTimer.stop()
+      // statusKillTimer is deliberately NOT stopped here. This Process owns the
+      // `setsid` wrapper, so its exit says nothing about the group behind it;
+      // cancelling the escalation on the leader's exit is how a descendant
+      // survives a teardown. The timer's own guard makes a late firing a no-op.
       if (root.statusOverflowed) {
         root.everLoaded = true
         root.healthInfo = { level: "critical", headline: root.lastError,
@@ -249,6 +301,13 @@ Item {
       root.lastError = Model.sanitize(root.statusErrText) || ("Could not run " + root.helperPath)
       root.healthInfo = { level: "critical", headline: root.lastError,
                           issues: [{ level: "critical", text: root.lastError }] }
+    }
+
+    // A widget can be unloaded mid-poll -- a bar layout change, a stack fold, a
+    // shell reload. Without this the run continues against machines nobody is
+    // waiting on an answer from.
+    Component.onDestruction: {
+      if (running) signal(15)
     }
   }
 }

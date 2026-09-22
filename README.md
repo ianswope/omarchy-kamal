@@ -67,13 +67,33 @@ cd <repo> && set -a && . <env> && set +a && kamal deploy
 
 **The two panel actions do change things, and both open a visible terminal so you watch them run.** `d` runs `kamal deploy`, which builds an image, pushes it to your registry and replaces the running containers on the box — behind a confirmation dialog naming the host, the command and how many commits it ships. `l` runs `kamal app logs -f`. Neither runs without a keypress, and neither runs at all when the configured env file is missing a variable `.kamal/secrets` requires.
 
-**Files it reads:** `~/.config/omarchy/kamal.json` (the app list), and per app, that repo's `config/deploy.yml`, its `.kamal/secrets`, and the env file you named. Each is opened once through `bin/kamal-read` with `O_NOFOLLOW|O_NONBLOCK`, validated on the descriptor (regular file, owned by you, one link) and read with a byte ceiling, so a symlink or a FIFO planted at one of those paths is refused rather than followed or waited on.
+**Files it reads:** `~/.config/omarchy/kamal.json` (the app list), and per app, that repo's `config/deploy.yml`, its `.kamal/secrets`, and the env file you named. Each is reached through `bin/kamal-read`, which walks to it one component at a time from `/`, holding an `openat(O_DIRECTORY|O_NOFOLLOW)` descriptor for every directory on the way and checking each one before descending: a real directory, owned by you or by root, and not writable by anyone else unless it is sticky. The file itself is then opened relative to the directory that was actually verified, with `O_NOFOLLOW` (a symlink there is refused, not followed) and `O_NONBLOCK` (a FIFO there cannot block the poll), validated on that descriptor — regular file, owned by you, one link — and read with a byte ceiling that rejects overflow rather than truncating it.
+
+The walk is the point: `O_NOFOLLOW` on the file alone refuses a symlink *at* the file and still resolves every directory above it by name, so a symlinked parent — or one swapped between two polls of a widget that reads on a timer — moves the whole read somewhere else while each individual open still looks correct. The verified boundary is the chain of descriptors, not the pathname.
 
 **Secret values are never read.** The credential check reports the variable NAMES on the left of each `=` in `.kamal/secrets` and in the env file, and compares the two sets. Nothing to the right of an `=` is parsed, stored, logged or displayed. The env file's mode comes from the descriptor that was read, and is reported when it is not `600`.
 
 **Files it writes:** none. There is no cache and no state file.
 
 **Network:** the health URL you configured or the `proxy.host` from `config/deploy.yml`, over HTTPS, with no redirects followed and a byte and time limit. Nothing else, and no telemetry.
+
+**Every program it starts is named by absolute path**, in the widget and in the script both — `/usr/bin/ssh`, `/usr/bin/git`, `/usr/bin/curl`, `/usr/bin/jq`, the three `/usr/bin/omarchy-launch-*` helpers, down to `/usr/bin/cat`. A bare name is a `PATH` lookup, and `PATH` comes from the session, so a directory prepended to it by anything else running as you would choose the program that runs — repeatedly, on a timer, including the `ssh` that carries your key. There is no `command -v` either: a lookup used as a test is the same lookup.
+
+**The run replaces its own environment.** `Service.qml` starts the helper through `/usr/bin/env -i` with `HOME`, `SSH_AUTH_SOCK`, `XDG_RUNTIME_DIR`, a fixed `PATH` and nothing else, so no shell in the run ever holds the session's environment. `GIT_DIR` and `GIT_WORK_TREE` would otherwise point every `git` here at a different repository, `BASH_ENV` runs a file before a shell's first line, and `LD_PRELOAD` loads code into every child. The script does the same replacement itself when a person runs it from a terminal.
+
+**The run has an absolute deadline and its own process group.** `setsid` puts the helper in a session of its own, so its process group holds the script and everything it starts — the parallel per-app probes, their ssh connections, git, curl — and nothing else on the desktop. A watchdog inside the script ends that whole group with `TERM`, a grace period, then `KILL`, after 90 seconds or as soon as the widget stops waiting for an answer. Each remote call also carries its own `timeout`, but a deadline per call is not a deadline for the run. Those `timeout` calls are all `--foreground`, because GNU `timeout` otherwise runs its command in a *new* process group and the group teardown walks straight past the ssh it was supposed to reach.
+
+## Tests
+
+```bash
+test/run-all.sh
+```
+
+Three suites, one per class of problem, each checked to fail when its fix is reverted:
+
+- `test/path-test.sh` puts a directory of shims first on `PATH` and loads the environment with `BASH_ENV`, `GIT_DIR` and friends, then asserts nothing chose a shim and no shell in the run read any of it.
+- `test/walk-test.py` plants a symlinked parent, a symlink two levels up, a symlink at the file, a `..`, a non-sticky world-writable parent, a FIFO, an oversized file and a hard link, and asserts each is refused while an ordinary file down a clean chain is read.
+- `test/watchdog-test.sh` stands in an `ssh` that never returns, runs a copy of the script with a three-second ceiling, and asserts the run ends anyway, that the `ssh` does not outlive it, and that it had a process group of its own.
 
 ## Removing
 

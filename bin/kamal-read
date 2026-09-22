@@ -1,14 +1,23 @@
 #!/usr/bin/python3 -I
 """Bounded, descriptor-bound reads of the four files this plugin did not create.
 
-Every subcommand does exactly ONE open of the pathname it was given, with
-O_NOFOLLOW so a symlink planted at the final component is refused rather than
-followed, and O_NONBLOCK so a FIFO planted there cannot block the poll forever.
-It then fstats THAT descriptor -- regular file, owned by us, one link -- and
-reads at most `limit + 1` bytes from the same descriptor, rejecting overflow
+Every subcommand walks to its file one component at a time from `/`, holding an
+`openat(O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC)` descriptor for each
+directory on the way and checking it before descending, then opens the final
+component relative to the directory that was actually verified. O_NOFOLLOW on
+the leaf alone would refuse a symlink AT the file and still resolve every
+directory above it by name, so a symlinked parent -- or one swapped between two
+polls of a widget that reads on a timer -- moves the whole read somewhere else
+while each individual open still looks correct. The verified boundary is the
+chain of descriptors, not the pathname.
+
+The leaf is opened O_NOFOLLOW (a symlink there is refused, not followed) and
+O_NONBLOCK (a FIFO planted there cannot block the poll forever). That
+descriptor is then fstatted -- regular file, owned by us, one link -- and at
+most `limit + 1` bytes are read from the same descriptor, rejecting overflow
 instead of truncating it into shape.
 
-The pathname is never resolved twice. Nothing here reads a value: the two
+No pathname is ever resolved twice. Nothing here reads a value: the two
 credential subcommands report the NAMES on the left of each `=` and nothing
 that follows it, which is all the widget needs to answer "would this env file
 satisfy this .kamal/secrets".
@@ -18,6 +27,7 @@ PyYAML from there. -I already ignores PYTHONPATH and the per-user site
 directory, which is the part another process can write to.
 """
 
+import errno
 import json
 import os
 import re
@@ -43,19 +53,111 @@ def fail(message):
     out({"ok": False, "error": message})
 
 
-def read_bounded(path, limit):
-    """One open, validated on the descriptor, at most limit + 1 bytes from it."""
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
-    except FileNotFoundError:
-        fail("no such file: %s" % path)
-    except OSError as exc:
-        # ELOOP is the symlink refusal, which is worth naming distinctly: it is
-        # the case that means someone put something where this file should be.
-        if exc.errno == 40:  # ELOOP
-            fail("refusing to read through a symlink: %s" % path)
-        fail("cannot open %s (%s)" % (path, exc.__class__.__name__))
+def split_absolute(path):
+    """The components of an absolute path, with nothing that re-resolves."""
+    if not path.startswith("/"):
+        fail("path must be absolute: %s" % path)
+    parts = [p for p in path.split("/") if p != ""]
+    if not parts:
+        fail("refusing to read a directory: %s" % path)
+    for part in parts:
+        # A walk cannot honour these: `..` climbs back out of the boundary the
+        # walk exists to hold, and an empty or `.` component is a pathname
+        # artefact rather than a directory to verify.
+        if part in (".", ".."):
+            fail("refusing a path with a %r component: %s" % (part, path))
+        if len(part) > 255:
+            fail("path component longer than 255 bytes: %s" % path)
+    if len(parts) > 64:
+        fail("path is more than 64 components deep: %s" % path)
+    return parts
 
+
+def check_directory(fd, shown, path):
+    """A directory is only a boundary if nobody else can move what is under it."""
+    info = os.fstat(fd)
+    if not stat.S_ISDIR(info.st_mode):
+        fail("not a directory: %s (in %s)" % (shown, path))
+    # Owned by us or by root. Anything else means the component -- and so every
+    # name resolved beneath it -- belongs to another principal.
+    if info.st_uid not in (0, os.geteuid()):
+        fail("directory %s is owned by uid %d (in %s)" % (shown, info.st_uid, path))
+    # Group- or world-writable means someone else can replace the next
+    # component after this one was checked, which is the race the walk closes.
+    #
+    # Unless it is sticky. S_ISVTX on a directory is precisely the rule that
+    # only an entry's owner may rename or remove it, so a world-writable /tmp
+    # still cannot have one of OUR components swapped out from under the walk:
+    # a stranger can add names beside ours, and the owner check on whatever is
+    # finally opened is what rejects those. Refusing sticky directories outright
+    # would reject /tmp and every per-user directory beneath it while buying
+    # nothing.
+    if info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX:
+        fail("directory %s is writable by others and not sticky (mode %o, in %s)"
+             % (shown, stat.S_IMODE(info.st_mode), path))
+
+
+def open_leaf(path):
+    """Walk from / with a held descriptor per component; open the leaf in it.
+
+    Returns an open descriptor for the final component. The caller owns it.
+    """
+    parts = split_absolute(path)
+    walked = ""
+    # `/` is the anchor and the one component not opened O_NOFOLLOW: there is
+    # nothing above it to have been substituted.
+    try:
+        dirfd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError as exc:
+        fail("cannot open / (%s)" % exc.__class__.__name__)
+
+    try:
+        check_directory(dirfd, "/", path)
+        for name in parts[:-1]:
+            walked += "/" + name
+            try:
+                nextfd = os.open(
+                    name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=dirfd,
+                )
+            except FileNotFoundError:
+                fail("no such directory: %s (in %s)" % (walked, path))
+            except NotADirectoryError:
+                fail("not a directory: %s (in %s)" % (walked, path))
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    fail("refusing to walk through a symlinked directory: %s" % walked)
+                if exc.errno == errno.EACCES:
+                    fail("permission denied on %s (in %s)" % (walked, path))
+                fail("cannot open %s (%s)" % (walked, exc.__class__.__name__))
+            os.close(dirfd)
+            dirfd = nextfd
+            check_directory(dirfd, walked, path)
+
+        leaf = parts[-1]
+        try:
+            return os.open(
+                leaf,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                dir_fd=dirfd,
+            )
+        except FileNotFoundError:
+            fail("no such file: %s" % path)
+        except OSError as exc:
+            # ELOOP is the symlink refusal, which is worth naming distinctly:
+            # it is the case that means someone put something where this file
+            # should be.
+            if exc.errno == errno.ELOOP:
+                fail("refusing to read through a symlink: %s" % path)
+            fail("cannot open %s (%s)" % (path, exc.__class__.__name__))
+    finally:
+        os.close(dirfd)
+
+
+def read_bounded(path, limit):
+    """One verified walk, one open, at most limit + 1 bytes from that fd."""
+    fd = open_leaf(path)
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):

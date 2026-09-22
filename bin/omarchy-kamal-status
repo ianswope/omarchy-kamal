@@ -27,22 +27,11 @@
 
 set -o pipefail
 
-CONFIG="${1:-$HOME/.config/omarchy/kamal.json}"
-# The path arrives as an argument, so no shell expands a leading tilde for us.
-[[ $CONFIG == "~"* ]] && CONFIG="$HOME${CONFIG#\~}"
-# Refresh remote-tracking refs before comparing. Off by default: a widget that
-# polls should not hit the network on every tick, and a stale origin/main is
-# reported as stale rather than silently mistaken for the truth.
-# Normalised to exactly 0 or 1 rather than used as given: this value reaches an
-# arithmetic context, and bash runs a command substitution found inside one.
-DO_FETCH=0
-[[ ${2:-0} == 1 ]] && DO_FETCH=1
-
-HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-READER="$HERE/kamal-read"
-
-# Absolute paths, so a PATH another process prepended to cannot substitute the
-# ssh that receives the key or the curl that makes the request.
+# Absolute paths for every executable, without exception. A PATH another
+# process prepended to would otherwise choose the ssh that receives the key,
+# the curl that makes the request, the git that reads the repository, and the
+# rm that clears the scratch directory. `command -v` and a bare name are the
+# same lookup, so neither appears below.
 JQ=/usr/bin/jq
 CURL=/usr/bin/curl
 SSH=/usr/bin/ssh
@@ -56,6 +45,137 @@ MKTEMP=/usr/bin/mktemp
 AWK=/usr/bin/awk
 SED=/usr/bin/sed
 TR=/usr/bin/tr
+RM=/usr/bin/rm
+CAT=/usr/bin/cat
+SLEEP=/usr/bin/sleep
+ENV=/usr/bin/env
+SETSID=/usr/bin/setsid
+BASH=/usr/bin/bash
+
+# --------------------------------------------- one re-exec, and then we own it
+#
+# Two things have to be true before this script does any work, and neither can
+# be arranged from inside the environment it inherits.
+#
+# ITS ENVIRONMENT IS ITS OWN. The shell that starts this passes down whatever
+# the session has, and a handful of those names are instructions rather than
+# information: GIT_DIR and GIT_WORK_TREE move every git command off the
+# repository being reported on, BASH_ENV runs a file before this script's first
+# line, LD_PRELOAD loads code into every child, PYTHONPATH and PYTHONSTARTUP
+# reach the reader. An allowlist is the only form of this that stays correct as
+# names are added, so the environment is replaced rather than filtered: HOME
+# because ssh and git need it, SSH_AUTH_SOCK because agent auth is how the
+# deploy boxes are reached, XDG_RUNTIME_DIR for the agent's socket directory,
+# and a PATH that exists only so children with their own bare lookups find the
+# system copies.
+#
+# IT IS ITS OWN PROCESS GROUP. `setsid` makes the shell below a session leader,
+# so its pid is a process-group id that contains this script and everything it
+# spawns -- the parallel per-app probes, their ssh connections, git, curl -- and
+# nothing else on the desktop. That group is what the watchdog can end as one
+# thing. Without it the only reachable target is this shell, and signalling it
+# leaves an ssh that has stopped responding, or a `git fetch` against an
+# unreachable remote, running until something else happens to them.
+if [[ -z ${KAMAL_STATUS_SUPERVISED:-} ]]; then
+  clean_env=(KAMAL_STATUS_SUPERVISED=1 PATH=/usr/bin:/bin LC_ALL=C)
+  [[ -n ${HOME:-} ]] && clean_env+=("HOME=$HOME")
+  [[ -n ${SSH_AUTH_SOCK:-} ]] && clean_env+=("SSH_AUTH_SOCK=$SSH_AUTH_SOCK")
+  [[ -n ${XDG_RUNTIME_DIR:-} ]] && clean_env+=("XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR")
+  exec "$ENV" -i "${clean_env[@]}" "$SETSID" -w "$BASH" -- "$0" "$@"
+fi
+
+# Everything below runs in that new session.
+
+CONFIG="${1:-$HOME/.config/omarchy/kamal.json}"
+# The path arrives as an argument, so no shell expands a leading tilde for us.
+[[ $CONFIG == "~"* ]] && CONFIG="$HOME${CONFIG#\~}"
+# Refresh remote-tracking refs before comparing. Off by default: a widget that
+# polls should not hit the network on every tick, and a stale origin/main is
+# reported as stale rather than silently mistaken for the truth.
+# Normalised to exactly 0 or 1 rather than used as given: this value reaches an
+# arithmetic context, and bash runs a command substitution found inside one.
+DO_FETCH=0
+[[ ${2:-0} == 1 ]] && DO_FETCH=1
+
+# ${BASH_SOURCE[0]} is an absolute path here (the shell is started with one),
+# and stripping the last component is a parameter expansion rather than a call
+# out to dirname -- one less executable to pin, and one less fork per poll.
+HERE=${BASH_SOURCE[0]%/*}
+READER="$HERE/kamal-read"
+[[ -x $READER ]] || { printf '{"ok":false,"error":"reader helper is missing","apps":[]}\n'; exit 0; }
+
+# ----------------------------------------------------------------- the watchdog
+#
+# An absolute ceiling on the whole run, enforced on the process group rather
+# than on this shell. Every individual remote call already carries its own
+# `timeout`, but a deadline per call is not a deadline for the run: eight apps
+# whose boxes all answer slowly, a DNS resolution that hangs before ssh's own
+# timer starts, or a `git fetch` against an unreachable remote each stay inside
+# their own limit while the poll as a whole does not finish. This is the bound
+# that does not depend on any of them being correct.
+#
+# A constant, deliberately, and not read from the environment or the config:
+# the value is the ceiling, so somewhere else being able to raise it is the
+# same as not having one.
+HARD_DEADLINE=90
+GRACE=2
+WORKER_PID=$$
+
+# EVERY `timeout` BELOW IS `--foreground`, AND THAT IS NOT COSMETIC. Without it
+# GNU timeout calls setpgid and runs the command in a process group of its own,
+# so the ssh it supervises is no longer in this script's group and the group
+# kill above walks straight past it: the run ends, the widget stops waiting, and
+# the connection to the box stays open until it decides to time out on its own.
+# Measured, not assumed -- an ssh under a plain `timeout` survives the teardown,
+# and under `--foreground` it does not. The mode's own caveat (timeout signals
+# the command and not the command's children) costs nothing here, because the
+# group kill is what reaches descendants.
+# Recorded now, while the supervisor that `setsid -w` left in place is still
+# there. If it goes, the shell above has given up on this run -- it hit its own
+# output ceiling, or the widget was destroyed -- and there is nothing left to
+# report to, so the group stops rather than finishing the work.
+ORIG_PPID=$PPID
+
+# The ppid of the worker, read without trusting the comm field: a process name
+# can contain spaces and parentheses, so the fields after it are found by
+# splitting on the LAST ")" rather than by counting from the left.
+worker_ppid() {
+  local line rest
+  read -r line < "/proc/$WORKER_PID/stat" 2>/dev/null || { printf '0'; return 0; }
+  rest=${line##*") "}
+  # shellcheck disable=SC2086 # deliberate word splitting on a known-numeric line
+  set -- $rest
+  printf '%s' "${2:-0}"
+}
+
+watchdog() {
+  # Deaf to the TERM it is about to send to its own group, so the escalation to
+  # KILL still happens after the grace period instead of dying with the first
+  # signal it delivers.
+  trap '' TERM
+  local ticks=0 limit=$(( HARD_DEADLINE * 2 ))
+  while (( ticks < limit )); do
+    "$SLEEP" 0.5
+    ticks=$(( ticks + 1 ))
+    [[ $(worker_ppid) == "$ORIG_PPID" ]] || break
+  done
+  # Negative pid: the whole group, which is this script and every descendant.
+  kill -TERM -- "-$WORKER_PID" 2>/dev/null
+  "$SLEEP" "$GRACE"
+  kill -KILL -- "-$WORKER_PID" 2>/dev/null
+}
+
+watchdog &
+WATCHDOG_PID=$!
+
+# The watchdog is the one thing that must not outlive the run, and the scratch
+# directory is the one thing that must not survive it either.
+cleanup() {
+  kill -TERM "$WATCHDOG_PID" 2>/dev/null
+  [[ -n ${tmpdir:-} ]] && "$RM" -rf -- "$tmpdir"
+  return 0
+}
+trap cleanup EXIT
 
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=5)
 SSH_DEADLINE=12
@@ -75,7 +195,7 @@ fail_json() {
   exit 0
 }
 
-command -v "$JQ" >/dev/null 2>&1 || { printf '{"ok":false,"error":"jq is not installed","apps":[]}\n'; exit 0; }
+[[ -x $JQ ]] || { printf '{"ok":false,"error":"jq is not installed","apps":[]}\n'; exit 0; }
 
 if [[ $CONFIG != /* ]]; then
   fail_json "config path must be absolute: $CONFIG"
@@ -274,7 +394,7 @@ probe_app() {
     # The cap is at the producer and is REMOTE_MAX + 1, so an overrun is a
     # detected condition rather than a truncated answer. -k so the kill follows
     # if ssh ignores the TERM, and LC_ALL=C so ${#} counts bytes.
-    remote_out=$(LC_ALL=C "$TIMEOUT" -k 2 "$SSH_DEADLINE" "$SSH" "${SSH_OPTS[@]}" -- "$host" \
+    remote_out=$(LC_ALL=C "$TIMEOUT" --foreground -k 2 "$SSH_DEADLINE" "$SSH" "${SSH_OPTS[@]}" -- "$host" \
       "$remote_cmd 2>/dev/null || true" 2>&1 | "$HEAD" -c $((REMOTE_MAX + 1)))
     remote_rc=$?
     if (( remote_rc != 0 )); then
@@ -324,7 +444,10 @@ probe_app() {
   # --- local side: what is pushed, what is not, what is uncommitted --------
   local o_sha="" head_sha="" behind=-1 unpushed=-1 fetched=0 dirty=false l_err="" d_when=""
   if [[ -n $repo && -d $repo/.git ]]; then
-    (( DO_FETCH )) && "$GIT" -C "$repo" fetch -q origin 2>/dev/null
+    # The only git call that touches the network, so the only one that can
+  # hang; the rest are local object reads. -k so the kill follows if it
+  # ignores the TERM.
+  (( DO_FETCH )) && "$TIMEOUT" --foreground -k 2 20 "$GIT" -C "$repo" fetch -q origin 2>/dev/null
     o_sha=$("$GIT" -C "$repo" rev-parse --verify --quiet "origin/$branch" 2>/dev/null)
     head_sha=$("$GIT" -C "$repo" rev-parse --verify --quiet HEAD 2>/dev/null)
     # Kamal tags the image with `git rev-parse HEAD`, so a deploy from a dirty
@@ -424,14 +547,18 @@ probe_app() {
 # Probe every app at once: each one costs an ssh round trip, so doing them in
 # series would make the refresh time scale with the number of servers.
 tmpdir=$("$MKTEMP" -d) || fail_json "could not create a temporary directory"
-trap 'rm -rf -- "$tmpdir"' EXIT
+probe_pids=()
 for (( i = 0; i < count; i++ )); do
   probe_app "$i" "$tmpdir/app-$i.json" &
+  probe_pids+=("$!")
 done
-wait
+# By pid, and never a bare `wait`: the watchdog is a background child of this
+# shell too, and a bare wait would sit on it until the deadline it exists to
+# enforce -- turning every poll into a 90-second one and then killing it.
+wait "${probe_pids[@]}"
 
 apps=$(for (( i = 0; i < count; i++ )); do
-  [[ -s $tmpdir/app-$i.json ]] && cat -- "$tmpdir/app-$i.json"
+  [[ -s $tmpdir/app-$i.json ]] && "$CAT" -- "$tmpdir/app-$i.json"
 done | "$JQ" -s '.')
 
 document=$("$JQ" -c -n --argjson now "$(int_or "$NOW" 0)" --argjson apps "$apps" --arg config "$CONFIG" \
