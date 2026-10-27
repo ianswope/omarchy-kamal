@@ -62,3 +62,18 @@ for (const phase of ['succeeded', 'failed', 'interrupted', 'incomplete']) assert
 assert.match(model.deploymentLabel({phase: 'incomplete'}), /incomplete/);
 assert.doesNotMatch(model.deploymentDetail({phase: 'failed', sha, reason: malicious}), /[<>&\u202e]/);
 console.log('ok - deployment phases remain distinct and result text is sanitized');
+
+const watched = {
+  name: 'Watched', repo: '', url: 'https://example.invalid', configError: 'no repo configured',
+  health: {checked: true, ok: true, code: 200, latencyMs: 10, error: ''},
+  local: {behind: -1, toDeploy: -1, removed: -1, unpushed: -1, dirty: false, error: ''},
+  secrets: {checked: false, missing: [], error: ''},
+  deployed: {error: 'no repo configured', versions: [], roles: []}
+};
+const watchedStatus = s => ({ok: true, configured: true, apps: [s]});
+assert.equal(model.health(watchedStatus(watched)).level, 'ok');
+assert.equal(model.driftText(watched), 'health check only');
+assert.equal(model.health(watchedStatus({...watched,
+  health: {...watched.health, ok: false, code: 502}})).level, 'critical');
+assert.equal(model.health(watchedStatus({...watched, url: ''})).level, 'warn');
+console.log('ok - a url without a repo is a health check, not a configuration fault');

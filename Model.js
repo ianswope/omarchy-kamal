@@ -111,6 +111,13 @@ function healthText(app) {
   return "HTTP " + app.health.code
 }
 
+// No repo but a URL is the documented way to watch something Kamal does not
+// deploy: it has a health check and nothing else, so its missing revision is
+// not a fault.
+function healthOnly(app) {
+  return !!app && !app.repo && !!app.url
+}
+
 function roles(app) {
   return app && app.deployed && Array.isArray(app.deployed.roles) ? app.deployed.roles : []
 }
@@ -167,6 +174,7 @@ function driftKnown(app) {
 
 function driftText(app) {
   if (!app) return ""
+  if (healthOnly(app)) return "health check only"
   if (mixedVersions(app)) return "mixed revisions"
   if (deadRoles(app).length > 0 || unknownRoles(app).length > 0) return "deployment incomplete or unknown"
   if (app.deployed && app.deployed.error) return "revision unknown"
@@ -255,10 +263,10 @@ function health(status) {
     })
     if (mixedVersions(a)) issues.push({ level: "warn", text: a.name + ": running mixed revisions "
       + a.deployed.versions.map(function(v) { return v.substring(0, 7) }).join(", ") })
-    if (a.configError) {
+    if (a.configError && !healthOnly(a)) {
       issues.push({ level: "warn", text: a.name + ": " + a.configError })
     }
-    if (a.deployed && a.deployed.error) {
+    if (a.deployed && a.deployed.error && !healthOnly(a)) {
       issues.push({ level: "warn", text: a.name + ": " + a.deployed.error })
     }
     if (a.local && a.local.error) {
