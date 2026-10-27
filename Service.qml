@@ -17,6 +17,11 @@ Item {
   property bool everLoaded: false
   property string lastError: ""
   property string actionStatus: ""
+  property var deployments: ({})
+  property string deploymentError: ""
+  readonly property bool activeDeployment: Object.keys(deployments).some(function(key) {
+    return Model.deploymentActive(deployments[key])
+  })
 
   readonly property string level: healthInfo.level
   readonly property string headline: healthInfo.headline
@@ -37,6 +42,7 @@ Item {
 
   readonly property string pluginDir: String(Qt.resolvedUrl(".")).replace(/^file:\/\//, "").replace(/\/$/, "")
   readonly property string helperPath: pluginDir + "/bin/omarchy-kamal-status"
+  readonly property string deployHelperPath: pluginDir + "/bin/kamal-deploy"
 
   // Every executable this plugin starts, by absolute path. A bare name is a
   // PATH lookup, and PATH is inherited from the session, so another process
@@ -101,6 +107,7 @@ Item {
     healthInfo = Model.health(parsed)
     everLoaded = true
     lastError = parsed.ok ? "" : (parsed.error || "")
+    readDeployments()
   }
 
   function note(text) {
@@ -113,20 +120,101 @@ Item {
   // Deploying replaces a live container, so it goes to a terminal where the
   // output and any failure are visible rather than being summarised in a popup.
   function deploy(app) {
-    var cmd = Model.deployCommandFor(app)
-    if (cmd === "") {
-      note("No repo and env file configured for " + (app ? app.name : "that app")); return
+    var reason = Model.deployBlockReason(app)
+    if (reason) { note(reason); return }
+    if (Model.deploymentActive(deploymentFor(app))) { note("A deployment is already active for " + app.name); return }
+    if (deployStart.running) { note("Another deployment terminal is starting; try again shortly"); return }
+    deployStart.payload = JSON.stringify(app)
+    deployStart.repo = app.repo
+    deployStart.output = ""
+    deployStart.command = ["/usr/bin/python3", "-I", deployHelperPath, "start"]
+    deployStart.running = true
+    note("Starting deployment for " + app.name + "…")
+  }
+
+  function deploymentFor(app) {
+    if (!app) return null
+    if (deployStart.running && deployStart.repo === app.repo) return { phase: "launching", sha: app.local.headSha }
+    return deployments[app.repo] || null
+  }
+
+  function readDeployments() {
+    if (deployStatus.running) return
+    deployStatus.payload = JSON.stringify(status)
+    deployStatus.output = ""
+    deployStatus.command = ["/usr/bin/python3", "-I", deployHelperPath, "observe"]
+    deployStatus.running = true
+  }
+
+  function applyDeploymentResult(raw, starting) {
+    try {
+      var result = JSON.parse(raw)
+      if (!result.ok) {
+        deploymentError = Model.sanitize(result.error) || "Deployment tracking unavailable"
+        if (starting) note(deploymentError)
+        return
+      }
+      deploymentError = ""
+      var next = starting ? Object.assign({}, deployments) : ({})
+      var records = starting ? [result.deployment] : result.deployments
+      records.forEach(function(record) {
+        record.reason = Model.sanitize(record.reason)
+        record.name = Model.sanitize(record.name)
+        next[record.repo] = record
+      })
+      var needsRefresh = records.some(function(record) {
+        var old = deployments[record.repo]
+        return record.phase === "verifying" && (!old || old.phase !== "verifying")
+      })
+      deployments = next
+      if (needsRefresh) refresh(false)
+    } catch (error) {
+      deploymentError = "Could not read deployment tracking status"
+      if (starting) note(deploymentError)
     }
-    // Refused, not warned: a deploy missing a required variable either dies
-    // part-way or boots an app configured from someone else's secrets file.
-    var missing = Model.missingSecrets(app)
-    if (missing.length > 0) {
-      note(app.name + ": " + app.env + " defines none of " + missing.join(", ") + " — fix that first")
-      return
+  }
+
+  // Only the small tracking document is read here. Deploy output stays in its
+  // terminal. The runner persists independently of this widget's lifetime.
+  Process {
+    id: deployStart
+    property string payload: ""
+    property string repo: ""
+    property string output: ""
+    stdinEnabled: true
+    onStarted: write(payload + "\n")
+    stdout: SplitParser {
+      splitMarker: ""
+      onRead: function(chunk) {
+        if (deployStart.output.length + chunk.length <= 131072) deployStart.output += chunk
+        else deployStart.signal(15)
+      }
     }
-    Quickshell.execDetached([root.binTerminal, cmd])
-    note("Deploying " + app.name + " in a terminal…")
-    settleTimer.restart()
+    onExited: { root.applyDeploymentResult(output, true); root.readDeployments() }
+  }
+
+  Process {
+    id: deployStatus
+    property string payload: ""
+    property string output: ""
+    stdinEnabled: true
+    onStarted: write(payload + "\n")
+    stdout: SplitParser {
+      splitMarker: ""
+      onRead: function(chunk) {
+        if (deployStatus.output.length + chunk.length <= 131072) deployStatus.output += chunk
+        else deployStatus.signal(15)
+      }
+    }
+    onExited: root.applyDeploymentResult(output, false)
+  }
+
+  Timer {
+    interval: root.activeDeployment ? 2000 : 10000
+    repeat: true
+    running: true
+    triggeredOnStart: true
+    onTriggered: root.readDeployments()
   }
 
   function logs(app) {
@@ -169,20 +257,13 @@ Item {
     onTriggered: root.refresh(false)
   }
 
-  // A deploy takes a while and finishes in the terminal, so re-read a few times
-  // afterwards instead of waiting out the whole interval.
+  // Continue remote verification while an operation is active. Completion is
+  // decided from a successful command AND a subsequent matching health poll.
   Timer {
-    id: settleTimer
-    property int ticks: 0
     interval: 15000
     repeat: true
-    running: false
-    onRunningChanged: if (running) ticks = 0
-    onTriggered: {
-      ticks += 1
-      root.refresh(false)
-      if (ticks >= 6) running = false
-    }
+    running: root.activeDeployment
+    onTriggered: root.refresh(false)
   }
 
   Timer {

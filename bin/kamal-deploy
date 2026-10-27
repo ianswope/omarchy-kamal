@@ -1,0 +1,355 @@
+#!/usr/bin/python3 -I
+"""Session-local deployment records and a visible-terminal command runner.
+
+Only `start` and `run` launch anything. `observe` consumes an existing status
+poll, never contacts a server, and never retains command output or credentials.
+"""
+import contextlib
+import fcntl
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import secrets
+import shlex
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+ACTIVE = {"launching", "running", "verifying"}
+VERIFY_SECONDS = 120
+LAUNCH_SECONDS = 60
+MAX_RECORD = 65536
+MAX_INPUT = 1048576
+MAX_APPS = 100
+TERMINAL = "/usr/bin/omarchy-launch-floating-terminal-with-presentation"
+SCRIPT = str(Path(__file__).absolute())
+
+
+def check_fd(fd, directory=False):
+    info = os.fstat(fd)
+    kind = stat.S_ISDIR if directory else stat.S_ISREG
+    if not kind(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError("deployment state must be private and owned by you")
+    if not directory and info.st_nlink != 1:
+        raise ValueError("deployment state must not be hard-linked")
+
+
+def runtime_fd():
+    path = os.environ.get("XDG_RUNTIME_DIR", "")
+    if not path.startswith("/") or any(p in (".", "..") for p in path.split("/")):
+        raise ValueError("a private XDG_RUNTIME_DIR is required for deployment tracking")
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in filter(None, path.split("/")):
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+            info = os.fstat(fd)
+            if info.st_uid not in (0, os.getuid()) or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX):
+                raise ValueError("unsafe runtime directory")
+        check_fd(fd, directory=True)
+        try:
+            os.mkdir("omarchy-kamal", 0o700, dir_fd=fd)
+        except FileExistsError:
+            pass
+        child = os.open("omarchy-kamal", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+        try:
+            check_fd(child, directory=True)
+        except Exception:
+            os.close(child)
+            raise
+        return child
+    finally:
+        os.close(fd)
+
+
+class Store:
+    def __enter__(self):
+        self.fd = runtime_fd()
+        self.lock = None
+        try:
+            self.lock = os.open("lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=self.fd)
+            check_fd(self.lock)
+            deadline = time.monotonic() + 3
+            while True:
+                try:
+                    fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise ValueError("Deployment tracking is busy; try again shortly")
+                    time.sleep(0.05)
+        except Exception:
+            if self.lock is not None:
+                os.close(self.lock)
+            os.close(self.fd)
+            raise
+        return self
+
+    def __exit__(self, *args):
+        os.close(self.lock)
+        os.close(self.fd)
+
+    def get(self, key):
+        if not re.fullmatch(r"[0-9a-f]{64}", key):
+            raise ValueError("invalid deployment key")
+        try:
+            fd = os.open(key + ".json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self.fd)
+        except FileNotFoundError:
+            return None
+        with os.fdopen(fd, "rb") as stream:
+            check_fd(stream.fileno())
+            raw = stream.read(MAX_RECORD + 1)
+        if len(raw) > MAX_RECORD:
+            raise ValueError("deployment record too large")
+        record = json.loads(raw)
+        if not isinstance(record, dict) or record.get("key") != key:
+            raise ValueError("invalid deployment record")
+        return record
+
+    def put(self, record):
+        raw = json.dumps(record).encode()
+        if len(raw) > MAX_RECORD:
+            raise ValueError("deployment record too large")
+        name = record["key"] + "." + secrets.token_hex(8) + ".tmp"
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=self.fd)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(raw)
+            os.replace(name, record["key"] + ".json", src_dir_fd=self.fd, dst_dir_fd=self.fd)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(name, dir_fd=self.fd)
+
+    def records(self):
+        names = [n[:-5] for n in os.listdir(self.fd) if re.fullmatch(r"[0-9a-f]{64}\.json", n)]
+        if len(names) > MAX_APPS:
+            raise ValueError("too many deployment records")
+        return [self.get(key) for key in names]
+
+    def lease(self, key):
+        fd = os.open(key + ".lease", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=self.fd)
+        try:
+            check_fd(fd)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except Exception:
+            os.close(fd)
+            raise
+
+    def leased(self, key):
+        try:
+            fd = self.lease(key)
+        except BlockingIOError:
+            return True
+        os.close(fd)
+        return False
+
+
+def process_identity(pid):
+    try:
+        fields = Path(f"/proc/{int(pid)}/stat").read_text().rsplit(") ", 1)[1].split()
+        return "" if fields[0] == "Z" else fields[19]
+    except (OSError, ValueError, IndexError):
+        return ""
+
+
+def reconcile(record, now, leased=False):
+    phase = record["phase"]
+    if phase == "launching" and now >= record["startedAt"] + LAUNCH_SECONDS:
+        record.update(phase="failed", reason="Terminal did not start the deployment", exitCode=None)
+    elif phase == "running" and process_identity(record["pid"]) != record["processIdentity"]:
+        if leased:
+            record.update(reason="Runner lost; deployment command may still be running")
+        else:
+            record.update(phase="interrupted", reason="Deployment runner stopped without a result", exitCode=None)
+    elif phase == "verifying" and now >= record["verifyUntil"]:
+        record.update(phase="incomplete", reason=record.get("reason") or "No fresh status check after deployment")
+    return record
+
+
+def targets(app):
+    return sorted((role["name"], host["host"])
+                  for role in app.get("deployed", {}).get("roles", [])
+                  for host in role.get("hosts", []))
+
+
+def verification_reason(record, status):
+    if not status.get("ok") or status.get("now", 0) < record["finishedAt"]:
+        return "Waiting for a fresh status check after deployment"
+    app = next((a for a in status.get("apps", []) if a.get("repo") == record["repo"]), None)
+    if app is None:
+        return "App is absent from the current status check"
+    expected = record["expected"]
+    if sorted(app.get("deployHosts", [])) != expected["deployHosts"]:
+        return "Deployment hosts changed since confirmation"
+    if len({host for role, host in expected["targets"]}) < len(expected["deployHosts"]):
+        return "Monitoring override does not cover every deployment host"
+    if not expected["targets"]:
+        return "Expected role and host coverage was unavailable at confirmation"
+    if targets(app) != [tuple(t) for t in expected["targets"]]:
+        return "Role or host coverage changed since confirmation"
+    for role in app["deployed"]["roles"]:
+        for host in role["hosts"]:
+            if host.get("error"):
+                return "A server could not be checked"
+            if host.get("running", 0) < 1:
+                return "An expected role instance is not running"
+            versions = host.get("versions", [])
+            if not versions or any(not re.fullmatch(r"[0-9a-f]{7,40}", v) or not record["sha"].startswith(v) for v in versions):
+                return "Some containers are not running the confirmed revision"
+    if not expected["url"]:
+        return "No health URL was configured at confirmation"
+    if app.get("url") != expected["url"] or app.get("healthPath") != expected["healthPath"]:
+        return "Health endpoint changed since confirmation"
+    health = app.get("health", {})
+    if not health.get("checked") or not health.get("ok") or health.get("error") or not 200 <= health.get("code", 0) < 300:
+        return "Application health has not passed"
+    return ""
+
+
+def snapshot(app):
+    repo, env = app.get("repo", ""), app.get("env", "")
+    if any(not p.startswith("/") or re.search(r"['\"`$;&|<>\\\s]", p) for p in (repo, env)):
+        raise ValueError("invalid repository or env path")
+    sha = app.get("local", {}).get("headSha", "")
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise ValueError("confirmed revision is missing")
+    secret_check = app.get("secrets", {})
+    if not secret_check.get("checked") or secret_check.get("error") or secret_check.get("missing") or app.get("configError"):
+        raise ValueError("deployment preflight did not pass")
+    return dict(key=hashlib.sha256(repo.encode()).hexdigest(), token=secrets.token_hex(16),
+                repo=repo, env=env, sha=sha, name=str(app.get("name", ""))[:200],
+                phase="launching", startedAt=time.time(), exitCode=None, reason="",
+                expected=dict(targets=targets(app), deployHosts=sorted(app.get("deployHosts", [])),
+                              url=app.get("url", ""), healthPath=app.get("healthPath", "")))
+
+
+def public(record):
+    return {k: record.get(k) for k in ("repo", "name", "sha", "phase", "reason", "exitCode", "startedAt", "finishedAt")}
+
+
+def start(app):
+    record = snapshot(app)
+    with Store() as store:
+        old = store.get(record["key"])
+        if store.leased(record["key"]) or old and reconcile(old, time.time())["phase"] in ACTIVE:
+            raise ValueError("A deployment is already active for this repository")
+        if old is None and len(store.records()) >= MAX_APPS:
+            raise ValueError("deployment tracking is limited to 100 repositories per session")
+        store.put(record)
+    command = shlex.join(["/usr/bin/python3", "-I", SCRIPT, "run", record["key"], record["token"]])
+    try:
+        subprocess.Popen([TERMINAL, command], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        with Store() as store:
+            record.update(phase="failed", reason="Could not launch the deployment terminal")
+            store.put(record)
+    return public(record)
+
+
+DEPLOY_COMMAND = '''cd -- "$1" && set -a && . "$2" && set +a && {
+  if [ "$(/usr/bin/git rev-parse HEAD)" = "$3" ]; then
+    kamal deploy
+  else
+    /usr/bin/printf '%s\\n' 'Checkout changed; refresh and confirm again.'
+    false
+  fi
+}'''
+
+
+def run_deployment(key, token):
+    with Store() as store:
+        record = store.get(key)
+        if not record or record["token"] != token or reconcile(record, time.time())["phase"] != "launching":
+            raise ValueError("This deployment launch is no longer valid")
+        lease = store.lease(key)
+        record.update(phase="running", pid=os.getpid(), processIdentity=process_identity(os.getpid()))
+        store.put(record)
+    child = None
+    interrupted = None
+
+    def on_signal(signum, frame):
+        nonlocal interrupted
+        interrupted = signum
+        if child is not None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(child.pid, signal.SIGTERM)
+
+    for signum in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):
+        signal.signal(signum, on_signal)
+    try:
+        child = subprocess.Popen(["/usr/bin/bash", "-c", DEPLOY_COMMAND, "kamal-deploy",
+                                  record["repo"], record["env"], record["sha"]], start_new_session=True,
+                                 pass_fds=(lease,))
+        while child.poll() is None:
+            if interrupted:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(child.pid, signal.SIGTERM)
+                try:
+                    child.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(child.pid, signal.SIGKILL)
+                    child.wait()
+                break
+            time.sleep(0.1)
+        rc = 128 + interrupted if interrupted else child.returncode
+        if interrupted:
+            # The shell may exit on TERM while a descendant ignores it.
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(child.pid, signal.SIGKILL)
+    except OSError:
+        rc = 127
+    finished = math.ceil(time.time())
+    with Store() as store:
+        record.update(exitCode=rc, finishedAt=finished, verifyUntil=finished + VERIFY_SECONDS,
+                      phase="interrupted" if interrupted or rc < 0 else "verifying" if rc == 0 else "failed",
+                      reason="Deployment interrupted" if interrupted else "Waiting for verification" if rc == 0 else f"Deployment command exited {rc}")
+        store.put(record)
+    os.close(lease)
+    return rc if rc >= 0 else 128 - rc
+
+
+def observe(status):
+    records = []
+    with Store() as store:
+        for record in store.records():
+            before = json.dumps(record)
+            record = reconcile(record, time.time(), store.leased(record["key"]))
+            if record["phase"] == "verifying":
+                reason = verification_reason(record, status)
+                record.update(reason=reason, phase="verifying" if reason else "succeeded")
+            if json.dumps(record) != before:
+                store.put(record)
+            records.append(public(record))
+    return records
+
+
+def main():
+    try:
+        verb = sys.argv[1]
+        if verb == "run":
+            return run_deployment(sys.argv[2], sys.argv[3])
+        raw = sys.stdin.buffer.readline(MAX_INPUT + 1)
+        if len(raw) > MAX_INPUT:
+            raise ValueError("deployment input too large")
+        payload = json.loads(raw)
+        result = {"ok": True, "deployment": start(payload)} if verb == "start" else {"ok": True, "deployments": observe(payload)} if verb == "observe" else None
+        if result is None:
+            raise ValueError("unknown deployment operation")
+        print(json.dumps(result))
+        return 0
+    except (OSError, ValueError, KeyError, TypeError, IndexError) as error:
+        print(json.dumps({"ok": False, "error": str(error)[:200]}))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

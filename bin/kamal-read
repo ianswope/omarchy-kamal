@@ -292,24 +292,38 @@ def cmd_deploy_yml(path):
         fail("%s is not a YAML mapping" % path)
 
     # --- roles and their hosts ---------------------------------------------
+    def host_list(raw):
+        if not isinstance(raw, list):
+            raw = [raw] if raw else []
+        if len(raw) > 50:
+            fail("a role lists more than 50 hosts")
+        hosts = []
+        for entry in raw:
+            # Kamal permits {hostname: tags} entries.
+            host = next(iter(entry)) if isinstance(entry, dict) and len(entry) == 1 else entry
+            if not isinstance(host, str) or not host or len(host) > 255:
+                fail("invalid server host in deploy.yml")
+            if host not in hosts:
+                hosts.append(host)
+        return hosts
+
     # `servers:` is either a list (one implicit "web" role) or a mapping of role
     # name to a host list or to {hosts:, cmd:, proxy:}.
     roles = []
     servers = doc.get("servers")
     if isinstance(servers, list):
-        roles.append({"name": "web", "hosts": [str(h)[:255] for h in servers[:50]],
+        roles.append({"name": "web", "hosts": host_list(servers),
                       "proxied": True})
     elif isinstance(servers, dict):
-        for name, spec in list(servers.items())[:20]:
+        if len(servers) > 20:
+            fail("deploy.yml lists more than 20 roles")
+        for name, spec in servers.items():
             hosts, proxied = [], True
             if isinstance(spec, list):
-                hosts = [str(h)[:255] for h in spec[:50]]
+                hosts = host_list(spec)
             elif isinstance(spec, dict):
                 raw = spec.get("hosts") or []
-                if isinstance(raw, list):
-                    hosts = [str(h)[:255] for h in raw[:50]]
-                elif raw:
-                    hosts = [str(raw)[:255]]
+                hosts = host_list(raw)
                 # proxy: false marks a role nothing routes to -- a jobs
                 # container, typically. It is why this widget reports roles at
                 # all: no health check will notice that one has died.

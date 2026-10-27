@@ -18,7 +18,7 @@ Panel {
   property int selectedIndex: 0
   property bool cursorActive: false
   property string confirmKind: ""
-  property int confirmApp: -1
+  property var confirmApp: null
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
@@ -36,16 +36,7 @@ Panel {
 
   readonly property string confirmMessage: {
     if (confirmKind !== "deploy") return ""
-    var a = appAt(confirmApp)
-    if (!a) return ""
-    var n = Model.behind(a)
-    var notes = []
-    notes.push(n > 0 ? "This ships " + n + " commit" + (n === 1 ? "" : "s") + "."
-                     : "Nothing new to ship.")
-    if (Model.isDirty(a)) notes.push("The tree is dirty — Kamal tags the image with HEAD.")
-    if (Model.unpushed(a) > 0) notes.push(Model.unpushed(a) + " commit(s) are not pushed.")
-    return "Deploy " + a.name + " to " + Model.hostOf(a) + "?\n\n"
-      + Model.deployCommandFor(a) + "\n\n" + notes.join("\n")
+    return Model.deployPreview(confirmApp)
   }
 
   function levelColor(level) {
@@ -87,8 +78,11 @@ Panel {
   function askDeploy(index) {
     var a = appAt(index)
     if (!a) return
-    if (Model.deployCommandFor(a) === "") { kamal.note("No deploy command configured for " + a.name); return }
-    confirmApp = index
+    if (Model.deploymentActive(kamal.deploymentFor(a))) { kamal.note("A deployment is already active for " + a.name); return }
+    var reason = Model.deployBlockReason(a)
+    if (reason) { kamal.note(a.name + ": " + reason); return }
+    // A timer refresh or config reorder must not change what was confirmed.
+    confirmApp = JSON.parse(JSON.stringify(a))
     confirmKind = "deploy"
     // Cancel first: the other button restarts a live site.
     confirmDialog.selectedIndex = 0
@@ -101,14 +95,14 @@ Panel {
 
   function cancelConfirm() {
     confirmKind = ""
-    confirmApp = -1
+    confirmApp = null
   }
 
   function acceptConfirm() {
-    var index = confirmApp
+    var app = confirmApp
     var kind = confirmKind
     cancelConfirm()
-    if (kind === "deploy") kamal.deploy(appAt(index))
+    if (kind === "deploy") kamal.deploy(app)
   }
 
   property var rowRegistry: ({})
@@ -214,7 +208,8 @@ Panel {
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(420))
     contentHeight: panel.fittedContentHeight(
-      headerColumn.implicitHeight + column.implicitHeight + footerColumn.implicitHeight + Style.space(34),
+      root.confirming ? Style.space(600)
+        : headerColumn.implicitHeight + column.implicitHeight + footerColumn.implicitHeight + Style.space(34),
       Style.space(600))
 
     PanelKeyCatcher {
@@ -260,6 +255,17 @@ Panel {
               color: root.heroColor
             }
           }
+        }
+
+        Text {
+          visible: kamal.deploymentError !== ""
+          width: parent.width
+          text: kamal.deploymentError
+          textFormat: Text.PlainText
+          color: root.urgent
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.WordWrap
         }
 
         Text {
@@ -433,6 +439,7 @@ Panel {
 
     readonly property bool down: Model.isDown(app) || Model.deadRoles(app).length > 0
     readonly property int behindCount: Model.behind(app)
+    readonly property var deployment: kamal.deploymentFor(app)
 
     hasCursor: root.cursorActive && root.selectedIndex === appIndex
     foreground: root.foreground
@@ -514,6 +521,17 @@ Panel {
           font.pixelSize: Style.font.caption
           elide: Text.ElideRight
         }
+
+        Text {
+          visible: !!appRow.deployment
+          width: parent.width
+          text: Model.deploymentDetail(appRow.deployment)
+          textFormat: Text.PlainText
+          color: appRow.deployment && ["failed", "interrupted", "incomplete"].indexOf(appRow.deployment.phase) >= 0 ? root.urgent : root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
+        }
       }
 
       Column {
@@ -523,7 +541,8 @@ Panel {
         Text {
           width: parent.width
           horizontalAlignment: Text.AlignRight
-          text: appRow.behindCount > 0 ? appRow.behindCount + " to deploy" : ""
+          text: Model.deploymentActive(appRow.deployment) ? Model.deploymentLabel(appRow.deployment)
+            : appRow.behindCount > 0 ? appRow.behindCount + " to deploy" : ""
           textFormat: Text.PlainText
           color: root.foreground
           font.family: root.fontFamily

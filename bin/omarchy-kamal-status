@@ -171,11 +171,18 @@ WATCHDOG_PID=$!
 # The watchdog is the one thing that must not outlive the run, and the scratch
 # directory is the one thing that must not survive it either.
 cleanup() {
-  kill -TERM "$WATCHDOG_PID" 2>/dev/null
+  # TERM is deliberately ignored by the watchdog. On a normal exit, kill and
+  # reap it so it cannot keep stdout open while our caller waits for EOF before
+  # reaping this worker. Keep it alive on failure/signal paths so its group-wide
+  # KILL still reaches any hanging descendants.
+  if [[ $1 == 0 ]]; then
+    kill -KILL "$WATCHDOG_PID" 2>/dev/null
+    wait "$WATCHDOG_PID" 2>/dev/null
+  fi
   [[ -n ${tmpdir:-} ]] && "$RM" -rf -- "$tmpdir"
   return 0
 }
-trap cleanup EXIT
+trap 'cleanup $?' EXIT
 
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=5)
 SSH_DEADLINE=12
@@ -290,6 +297,33 @@ fi
 
 # ------------------------------------------------------------- per-app probes
 
+# Each result is bounded and always identifies its host. Empty successful
+# docker output means missing containers; docker/SSH failures mean unknown.
+probe_host() {
+  local target="$1" service="$2" out="$3"
+  local output="" error="" rc=0 remote_cmd
+  if ! ssh_target_is_safe "$target"; then
+    error="refusing an ssh target with unexpected characters"
+  else
+    remote_cmd="docker ps -a --filter label=service=$(shell_quote "$service") --format '{{.Label \"role\"}}|{{.Names}}|{{.Image}}|{{.State}}'"
+    output=$(LC_ALL=C "$TIMEOUT" --foreground -k 2 "$SSH_DEADLINE" "$SSH" "${SSH_OPTS[@]}" -- "$target" \
+      "$remote_cmd" 2>&1 | "$HEAD" -c $((REMOTE_MAX + 1)))
+    rc=$?
+    if (( ${#output} > REMOTE_MAX )); then
+      error="container list exceeds ${REMOTE_MAX} bytes"
+    elif (( rc != 0 )); then
+      error="container probe failed (exit $rc): ${output:0:160}"
+    elif ! "$JQ" -en --arg output "$output" '
+      $output | split("\n") | map(select(length > 0))
+      | length <= 2000 and all(.[]; (split("|") | length) == 4)' >/dev/null; then
+      error="invalid container response"
+    fi
+  fi
+  [[ -n $error ]] && output=""
+  "$JQ" -cn --arg host "$target" --arg error "$error" --arg output "$output" \
+    '{host: $host, error: $error, output: $output}' >"$out"
+}
+
 probe_app() {
   local idx="$1" out="$2"
   local name repo branch envfile url_override health_override ssh_override
@@ -363,96 +397,75 @@ probe_app() {
     fi
   fi
 
-  # --- the running containers, by role -------------------------------------
-  local d_sha="" d_err="" roles_state="[]"
-  local host=""
+  # --- every declared host, with one connection per unique SSH target ------
+  local d_sha="" d_err="" roles_state="[]" hosts_json="[]" versions_json="[]"
+  local host="" host_docs="[]" deploy_hosts="[]"
+  deploy_hosts=$("$JQ" -c '[.[].hosts[]] | unique' <<<"$roles_json")
   if [[ -n $ssh_override ]]; then
-    host="$ssh_override"
+    # Preserve the explicit override: all roles are checked on this one host.
+    roles_json=$("$JQ" -c --arg host "$ssh_override" 'map(.hosts = [$host])' <<<"$roles_json")
   else
-    host=$("$JQ" -r 'if length > 0 then (.[0].hosts[0] // "") else "" end' <<<"$roles_json")
-    [[ -n $host && $host != null ]] && host="$ssh_user@$host"
+    roles_json=$("$JQ" -c --arg user "$ssh_user" 'map(.hosts |= map($user + "@" + .))' <<<"$roles_json")
   fi
+  hosts_json=$("$JQ" -c '[.[].hosts[]] | unique' <<<"$roles_json")
+  host=$("$JQ" -r '.[0] // ""' <<<"$hosts_json")
 
   if [[ -n $cfg_err ]]; then
     d_err="$cfg_err"
-  elif [[ -z $service ]]; then
-    d_err="no service name in deploy.yml"
   elif ! service_is_safe "$service"; then
-    d_err="refusing a service name with unexpected characters"
-  elif [[ -z $host || $host == null ]]; then
-    d_err="no host in deploy.yml"
-  elif ! ssh_target_is_safe "$host"; then
-    d_err="refusing an ssh target with unexpected characters"
+    d_err="missing or invalid service name in deploy.yml"
+  elif [[ -z $host ]] || "$JQ" -e 'any(.[]; (.hosts | length) == 0)' >/dev/null <<<"$roles_json"; then
+    d_err="a role has no hosts in deploy.yml"
   else
-    local remote_cmd remote_out remote_rc
-    # Only the interpolated VALUE is quoted for the remote shell. Quoting the
-    # whole command instead would hand the remote shell one enormous word to
-    # look up as a command name -- which fails silently, because the `|| true`
-    # below is what keeps a box without docker from reading as an ssh failure,
-    # and it swallows a "command not found" just as happily.
-    remote_cmd="docker ps -a --filter label=service=$(shell_quote "$service") --format '{{.Label \"role\"}}|{{.Names}}|{{.Image}}|{{.State}}'"
-    # The cap is at the producer and is REMOTE_MAX + 1, so an overrun is a
-    # detected condition rather than a truncated answer. -k so the kill follows
-    # if ssh ignores the TERM, and LC_ALL=C so ${#} counts bytes.
-    remote_out=$(LC_ALL=C "$TIMEOUT" --foreground -k 2 "$SSH_DEADLINE" "$SSH" "${SSH_OPTS[@]}" -- "$host" \
-      "$remote_cmd 2>/dev/null || true" 2>&1 | "$HEAD" -c $((REMOTE_MAX + 1)))
-    remote_rc=$?
-    if (( remote_rc != 0 )); then
-      d_err=$(printf '%s' "$remote_out" | "$TR" -d '\r' | "$TR" '\n' ' ' | "$SED" 's/  */ /g; s/^ //; s/ $//')
-      d_err=${d_err:0:200}
-      d_err=${d_err:-"ssh to $host failed"}
-    elif (( ${#remote_out} > REMOTE_MAX )); then
-      d_err="the container list from $host exceeds ${REMOTE_MAX} bytes"
-    else
-      remote_out=$(printf '%s' "$remote_out" | "$TR" -d '\r')
-      if [[ -z ${remote_out//[[:space:]]/} ]]; then
-        d_err="no containers labelled service=$service on $host"
-      else
-        # Per declared role: how many of its containers are running, and at what
-        # revision. A role declared in deploy.yml with nothing running is the
-        # signal this widget exists for. The row count is capped as well: a byte
-        # ceiling still admits thousands of short lines.
-        roles_state=$("$JQ" -c --arg out "$remote_out" '
-          def revision($name; $image):
-            (($image | split(":") | last) // "") as $tag
-            | if ($tag | test("^[0-9a-f]{7,40}$")) then $tag
-              else (($name | split("-") | last) // "") end;
-          ($out | split("\n") | map(select(length > 0) | split("|")) | .[0:2000]
-                | map({role: (.[0] // "")[0:64],
-                       version: revision((.[1] // ""); (.[2] // ""))[0:64],
-                       state: (.[3] // "")[0:32]})) as $c
-          | map(. as $r
-              | ($c | map(select(.role == $r.name))) as $mine
-              | {name: $r.name,
-                 proxied: $r.proxied,
-                 running: ($mine | map(select(.state == "running")) | length),
-                 total: ($mine | length),
-                 version: (($mine | map(select(.state == "running")) | .[0].version) // "")})
-        ' <<<"$roles_json")
-        # The revision of the proxied role is the one the site is serving.
-        d_sha=$("$JQ" -r 'map(select(.proxied)) | (.[0].version // "")' <<<"$roles_state")
-        [[ -z $d_sha || $d_sha == null ]] && d_sha=$("$JQ" -r '(.[0].version // "")' <<<"$roles_state")
-        [[ $d_sha == null ]] && d_sha=""
-        if [[ -n $d_sha && ! $d_sha =~ ^[0-9a-f]{7,40}$ ]]; then
-          d_err="running container carries no git revision"
-          d_sha=""
-        fi
+    local host_count host_idx target
+    local host_pids=()
+    host_count=$("$JQ" -r 'length' <<<"$hosts_json")
+    for (( host_idx = 0; host_idx < host_count; host_idx++ )); do
+      target=$("$JQ" -r --argjson i "$host_idx" '.[$i]' <<<"$hosts_json")
+      probe_host "$target" "$service" "$tmpdir/host-$idx-$host_idx.json" &
+      host_pids+=("$!")
+      # Bound fan-out within each app; the whole run still has its deadline.
+      if (( ${#host_pids[@]} == 8 )); then
+        wait "${host_pids[@]}"
+        host_pids=()
+      fi
+    done
+    (( ${#host_pids[@]} )) && wait "${host_pids[@]}"
+    host_docs=$(for (( host_idx = 0; host_idx < host_count; host_idx++ )); do
+      "$CAT" -- "$tmpdir/host-$idx-$host_idx.json"
+    done | "$JQ" -s '.')
+    roles_state=$("$JQ" -c --argjson roles "$roles_json" -f "$HERE/kamal-containers.jq" <<<"$host_docs")
+    versions_json=$("$JQ" -c '[.[].versions[]] | unique' <<<"$roles_state")
+    # A single SHA is meaningful only when every expected role/host is present
+    # and all running containers agree. Mixed/partial deployments stay explicit.
+    if "$JQ" -e 'length > 0 and all(.[]; .missing == 0 and .unknown == 0)' >/dev/null <<<"$roles_state" \
+       && [[ $("$JQ" -r 'length' <<<"$versions_json") == 1 ]]; then
+      d_sha=$("$JQ" -r '.[0]' <<<"$versions_json")
+      if [[ ! $d_sha =~ ^[0-9a-f]{7,40}$ ]]; then
+        d_err="running container carries no git revision"
+        d_sha=""
       fi
     fi
   fi
 
   # --- local side: what is pushed, what is not, what is uncommitted --------
   local o_sha="" head_sha="" behind=-1 unpushed=-1 fetched=0 dirty=false l_err="" d_when=""
-  if [[ -n $repo && -d $repo/.git ]]; then
+  local current_branch="" head_subject="" to_deploy=-1 removed=-1
+  if [[ -n $repo ]] && "$GIT" -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
     # The only git call that touches the network, so the only one that can
   # hang; the rest are local object reads. -k so the kill follows if it
   # ignores the TERM.
   (( DO_FETCH )) && "$TIMEOUT" --foreground -k 2 20 "$GIT" -C "$repo" fetch -q origin 2>/dev/null
     o_sha=$("$GIT" -C "$repo" rev-parse --verify --quiet "origin/$branch" 2>/dev/null)
     head_sha=$("$GIT" -C "$repo" rev-parse --verify --quiet HEAD 2>/dev/null)
-    # Kamal tags the image with `git rev-parse HEAD`, so a deploy from a dirty
-    # tree produces an image labelled with a commit it does not contain. Worth
-    # its own signal, not folded into "unpushed".
+    current_branch=$("$GIT" -C "$repo" symbolic-ref --quiet --short HEAD 2>/dev/null)
+    head_subject=$("$GIT" -C "$repo" log -1 --format=%s 2>/dev/null | "$HEAD" -c 200)
+    if [[ -n $d_sha && -n $head_sha ]] && "$GIT" -C "$repo" cat-file -e "$d_sha^{commit}" 2>/dev/null; then
+      to_deploy=$(int_or "$("$GIT" -C "$repo" rev-list --count "$d_sha..$head_sha" 2>/dev/null)" -1)
+      removed=$(int_or "$("$GIT" -C "$repo" rev-list --count "$head_sha..$d_sha" 2>/dev/null)" -1)
+    fi
+    # Dirty changes are excluded by Kamal's default Git build context, but may
+    # be included by an explicitly configured local builder context.
     [[ -n $("$GIT" -C "$repo" status --porcelain 2>/dev/null | "$HEAD" -c 4096) ]] && dirty=true
     if [[ -n $o_sha ]]; then
       if [[ -n $d_sha ]] && "$GIT" -C "$repo" cat-file -e "$d_sha^{commit}" 2>/dev/null; then
@@ -517,6 +530,9 @@ probe_app() {
   "$JQ" -n \
     --arg name "$name" --arg repo "$repo" --arg branch "$branch" \
     --arg service "$service" --arg url "$url" --arg healthPath "$health_path" \
+    --argjson hosts "$hosts_json" --argjson deployHosts "$deploy_hosts" --argjson versions "$versions_json" \
+    --arg currentBranch "$current_branch" --arg headSubject "$head_subject" \
+    --argjson toDeploy "$to_deploy" --argjson removed "$removed" \
     --arg host "$host" --arg envfile "$envfile" --arg cfgErr "$cfg_err" \
     --argjson hChecked "$h_checked" --argjson hCode "$(int_or "$h_code" 0)" \
     --argjson hMs "$(int_or "$h_ms" 0)" --arg hErr "$h_err" \
@@ -529,14 +545,16 @@ probe_app() {
     --arg sMode "$s_mode" --arg sErr "$s_err" --argjson sLiterals "$(int_or "$s_literals" 0)" \
     '{
       name: $name, repo: $repo, branch: $branch, service: $service,
-      url: $url, healthPath: $healthPath, host: $host, env: $envfile,
+      url: $url, healthPath: $healthPath, host: $host, hosts: $hosts, deployHosts: $deployHosts, env: $envfile,
       configError: $cfgErr,
       health: {checked: $hChecked, code: $hCode, ok: ($hCode >= 200 and $hCode < 400),
                latencyMs: $hMs, error: $hErr},
       deployed: {sha: $dSha, short: ($dSha | .[0:7]), committedAt: $dWhen,
-                 error: $dErr, roles: $roles},
+                 error: $dErr, roles: $roles, versions: $versions},
       local: {originSha: $oSha, originShort: ($oSha | .[0:7]),
               headSha: $headSha, headShort: ($headSha | .[0:7]),
+              currentBranch: $currentBranch, headSubject: $headSubject,
+              toDeploy: $toDeploy, removed: $removed,
               behind: $behind, unpushed: $unpushed, dirty: $dirty,
               fetchedAt: $fetched, error: $lErr},
       secrets: {checked: $sChecked, missing: $sMissing, mode: $sMode,
@@ -544,8 +562,7 @@ probe_app() {
     }' >"$out"
 }
 
-# Probe every app at once: each one costs an ssh round trip, so doing them in
-# series would make the refresh time scale with the number of servers.
+# Probe apps concurrently; each app also checks its hosts in bounded batches.
 tmpdir=$("$MKTEMP" -d) || fail_json "could not create a temporary directory"
 probe_pids=()
 for (( i = 0; i < count; i++ )); do

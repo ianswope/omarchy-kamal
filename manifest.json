@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "ianswope.kamal",
   "name": "Kamal",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": "Ian Swope",
   "license": "MIT",
   "description": "Kamal 2 apps in the Omarchy bar: whether each one answers, which revision its containers are actually running, whether every role is up, and how far that is behind what you pushed.",
@@ -14,7 +14,7 @@
   },
   "barWidget": {
     "displayName": "Kamal",
-    "description": "Health, running revision, per-role container state and undeployed-commit count for each Kamal app, with deploy from the panel.",
+    "description": "Health, revisions and role coverage across every server, with confirmed deployments and verified completion from the panel.",
     "category": "Developer Tools",
     "allowMultiple": false,
     "defaultSection": "right",

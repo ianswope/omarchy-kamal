@@ -38,6 +38,8 @@ function sanitizeApp(app) {
   app.service = sanitize(app.service)
   app.url = sanitize(app.url)
   app.host = sanitize(app.host)
+  app.deployHosts = (Array.isArray(app.deployHosts) ? app.deployHosts : []).map(sanitize)
+  app.hosts = (Array.isArray(app.hosts) ? app.hosts : []).map(sanitize)
   app.env = sanitize(app.env)
   app.configError = sanitize(app.configError)
   if (app.health) app.health.error = sanitize(app.health.error)
@@ -45,9 +47,15 @@ function sanitizeApp(app) {
     app.deployed.short = sanitize(app.deployed.short)
     app.deployed.error = sanitize(app.deployed.error)
     app.deployed.committedAt = sanitize(app.deployed.committedAt)
+    app.deployed.versions = (Array.isArray(app.deployed.versions) ? app.deployed.versions : []).map(sanitize)
     app.deployed.roles = (Array.isArray(app.deployed.roles) ? app.deployed.roles : []).map(function(r) {
       r.name = sanitize(r.name)
       r.version = sanitize(r.version)
+      r.hosts = (Array.isArray(r.hosts) ? r.hosts : []).map(function(h) {
+        h.host = sanitize(h.host)
+        h.error = sanitize(h.error)
+        return h
+      })
       return r
     })
   }
@@ -55,6 +63,8 @@ function sanitizeApp(app) {
     app.local.originShort = sanitize(app.local.originShort)
     app.local.headShort = sanitize(app.local.headShort)
     app.local.error = sanitize(app.local.error)
+    app.local.currentBranch = sanitize(app.local.currentBranch)
+    app.local.headSubject = sanitize(app.local.headSubject)
   }
   if (app.secrets) {
     app.secrets.error = sanitize(app.secrets.error)
@@ -110,27 +120,29 @@ function roles(app) {
 // check anywhere notices when it dies. A declared role with nothing running is
 // as serious as a dead site.
 function deadRoles(app) {
-  return roles(app).filter(function(r) { return Number(r.running) === 0 })
+  return roles(app).filter(function(r) { return Number(r.missing) > 0 })
+}
+
+function unknownRoles(app) {
+  return roles(app).filter(function(r) { return Number(r.unknown) > 0 })
+}
+
+function mixedVersions(app) {
+  return !!(app && app.deployed && app.deployed.versions && app.deployed.versions.length > 1)
 }
 
 function rolesText(app) {
   var list = roles(app)
   if (list.length === 0) return ""
   return list.map(function(r) {
-    return r.name + " " + Number(r.running) + "/" + (Number(r.running) === 0 ? "0" : Number(r.running))
+    return r.name + " " + Number(r.available) + "/" + Number(r.expected)
+      + (Number(r.unknown) > 0 ? " (" + r.unknown + " unknown)" : "")
   }).join(" · ")
 }
 
-// Roles are only worth spelling out when one is missing or when there is more
-// than one; a lone healthy web role is already implied by the health check.
+// Count available hosts, not overlapping containers during a rolling deploy.
 function rolesSummary(app) {
-  var dead = deadRoles(app)
-  if (dead.length > 0) {
-    return dead.map(function(r) { return r.name + " down" }).join(" · ")
-  }
-  var list = roles(app)
-  if (list.length <= 1) return ""
-  return list.map(function(r) { return r.name }).join(" + ") + " up"
+  return rolesText(app)
 }
 
 function behind(app) {
@@ -155,6 +167,8 @@ function driftKnown(app) {
 
 function driftText(app) {
   if (!app) return ""
+  if (mixedVersions(app)) return "mixed revisions"
+  if (deadRoles(app).length > 0 || unknownRoles(app).length > 0) return "deployment incomplete or unknown"
   if (app.deployed && app.deployed.error) return "revision unknown"
   if (!driftKnown(app)) {
     if (app.local && app.local.error) return app.local.error
@@ -179,7 +193,7 @@ function missingSecrets(app) {
 }
 
 function secretsReady(app) {
-  return !!(app && app.secrets && app.secrets.checked === true && missingSecrets(app).length === 0)
+  return !!(app && app.secrets && app.secrets.checked === true && !app.secrets.error && missingSecrets(app).length === 0)
 }
 
 function secretsText(app) {
@@ -230,10 +244,17 @@ function health(status) {
       issues.push({ level: "critical", text: a.name + " is not answering " + (a.url || "its health URL") + " (" + healthText(a) + ")" })
     }
     deadRoles(a).forEach(function(r) {
+      var hosts = r.hosts.filter(function(h) { return !h.error && Number(h.running) === 0 }).map(function(h) { return h.host })
       issues.push({ level: "critical",
-                    text: a.name + ": the " + r.name + " role has no running container"
-                          + (r.proxied === false ? " (nothing health-checks it)" : "") })
+                    text: a.name + ": " + r.name + " missing on " + hosts.join(", ") })
     })
+    unknownRoles(a).forEach(function(r) {
+      r.hosts.filter(function(h) { return !!h.error }).forEach(function(h) {
+        issues.push({ level: "warn", text: a.name + ": " + h.host + " — " + h.error })
+      })
+    })
+    if (mixedVersions(a)) issues.push({ level: "warn", text: a.name + ": running mixed revisions "
+      + a.deployed.versions.map(function(v) { return v.substring(0, 7) }).join(", ") })
     if (a.configError) {
       issues.push({ level: "warn", text: a.name + ": " + a.configError })
     }
@@ -258,7 +279,7 @@ function health(status) {
                           + (Number(a.secrets.literals) === 1 ? "" : "s") + " in it" })
     }
     if (isDirty(a)) {
-      issues.push({ level: "warn", text: a.name + ": uncommitted changes — Kamal tags the image with HEAD" })
+      issues.push({ level: "warn", text: a.name + ": uncommitted changes present" })
     }
     var b = behind(a)
     if (b > 0) {
@@ -311,7 +332,7 @@ function headlineFor(status, level, issues) {
 // only things a person would act on, not informational notes.
 function attentionCount(status) {
   return (status.apps || []).filter(function(a) {
-    return isDown(a) || deadRoles(a).length > 0 || behind(a) > 0
+    return isDown(a) || deadRoles(a).length > 0 || unknownRoles(a).length > 0 || mixedVersions(a) || behind(a) > 0
   }).length
 }
 
@@ -397,8 +418,54 @@ function deployCommandFor(app) {
   return "cd " + app.repo + " && set -a && . " + app.env + " && set +a && kamal deploy"
 }
 
+function deployBlockReason(app) {
+  if (!app || !isSafePath(app.repo) || !isSafePath(app.env)) return "No valid repo and env file configured"
+  if (app.configError) return app.configError
+  if (!app.local || !/^[0-9a-f]{40}$/.test(app.local.headSha || "")) return "Current checkout revision is unknown; refresh first"
+  if (!secretsReady(app)) return secretsText(app) || "Secrets check did not complete; refresh first"
+  return ""
+}
+
+function deployPreview(app) {
+  if (!app || !app.local) return "Checkout unknown"
+  var local = app.local
+  var hosts = app.deployHosts && app.deployHosts.length ? app.deployHosts.join(", ") : hostOf(app)
+  var lines = ["Deploy " + app.name + " to " + hosts + "?",
+    "Checkout: " + (local.currentBranch || "detached HEAD") + " · " + local.headShort,
+    local.headSubject || ""]
+  if (local.currentBranch !== app.branch) lines.push("Checkout differs from tracked branch " + app.branch + ".")
+  if (Number(local.toDeploy) >= 0 && Number(local.removed) >= 0) {
+    lines.push(local.toDeploy + " added commit(s), " + local.removed + " removed commit(s) versus the running revision.")
+  } else {
+    lines.push("Changes versus the running deployment are unknown.")
+  }
+  if (unpushed(app) > 0) lines.push(unpushed(app) + " commit(s) are not on origin/" + app.branch + ".")
+  if (isDirty(app)) lines.push("Uncommitted changes present. The default Git build excludes them; a local build context may include them.")
+  lines.push("", deployCommandFor(app))
+  return lines.join("\n")
+}
+
 function logsCommandFor(app) {
   if (!app) return ""
   if (!isSafePath(app.repo) || !isSafePath(app.env)) return ""
   return "cd " + app.repo + " && set -a && . " + app.env + " && set +a && kamal app logs -f"
+}
+
+function deploymentActive(deployment) {
+  return !!deployment && ["launching", "running", "verifying"].indexOf(deployment.phase) >= 0
+}
+
+function deploymentLabel(deployment) {
+  if (!deployment) return ""
+  var labels = { launching: "Starting deploy", running: "Deploying", verifying: "Verifying",
+    succeeded: "Deployed", failed: "Deploy failed", interrupted: "Deploy interrupted",
+    incomplete: "Verification incomplete" }
+  return labels[deployment.phase] || "Deployment status unknown"
+}
+
+function deploymentDetail(deployment) {
+  if (!deployment) return ""
+  var text = deploymentLabel(deployment) + " · " + sanitize(deployment.sha).substring(0, 7)
+  if (deployment.reason) text += " · " + sanitize(deployment.reason)
+  return text
 }
