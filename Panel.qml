@@ -167,30 +167,14 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    slotSize: Style.bar.iconSlot + (root.countVisible ? countMetrics.width + Style.space(3) : 0)
+    slotSize: Style.bar.iconSlot + (root.countVisible ? countMetrics.width + Style.space(4) : 0)
+    foreground: root.barIconColor
+    // The bar scales everything in iconComponent down to its shared icon size,
+    // so the count goes in labelText, which keeps its text size.
+    labelText: root.countVisible ? kamal.barCountText : ""
     iconComponent: Component {
-      Item {
-        Row {
-          anchors.centerIn: parent
-          spacing: Style.space(3)
-
-          KamalIcon {
-            anchors.verticalCenter: parent.verticalCenter
-            iconSize: Style.space(12)
-            color: root.barIconColor
-          }
-
-          Text {
-            anchors.verticalCenter: parent.verticalCenter
-            visible: root.countVisible
-            text: kamal.barCountText
-            textFormat: Text.PlainText
-            color: root.barIconColor
-            font.family: root.fontFamily
-            font.pixelSize: Style.bar.iconFont
-            renderType: Text.NativeRendering
-          }
-        }
+      KamalIcon {
+        color: root.barIconColor
       }
     }
     onPressed: function(buttonCode) {
